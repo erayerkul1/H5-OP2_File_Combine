@@ -7,6 +7,10 @@ Birden fazla .op2 veya .h5 dosyasını tek bir dosyada birleştirir.
 import sys
 import os
 import glob
+import io
+import threading
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
 from pathlib import Path
 
 
@@ -164,7 +168,7 @@ def _set_nested_attr(obj, dotted_name: str, value) -> None:
 # H5 Birleştirme
 # ──────────────────────────────────────────────
 
-def combine_h5(input_files: list[str], output_path: str) -> None:
+def combine_h5(input_files: list[str], output_path: str, conflict_mode: str | None = None) -> None:
     try:
         import h5py
         import numpy as np
@@ -174,7 +178,8 @@ def combine_h5(input_files: list[str], output_path: str) -> None:
 
     print(f"\n{len(input_files)} adet H5 dosyası birleştiriliyor...")
 
-    conflict_mode = _ask_conflict_mode()
+    if conflict_mode is None:
+        conflict_mode = _ask_conflict_mode()
 
     with h5py.File(output_path, "w") as out_file:
         for file_idx, filepath in enumerate(input_files):
@@ -280,5 +285,181 @@ def main() -> None:
         combine_h5(input_files, output_path)
 
 
-if __name__ == "__main__":
-    main()
+# ──────────────────────────────────────────────
+# Tkinter GUI
+# ──────────────────────────────────────────────
+
+class _PrintRedirector(io.StringIO):
+    """sys.stdout'u tkinter Text widget'ına yönlendirir."""
+    def __init__(self, callback):
+        super().__init__()
+        self._cb = callback
+
+    def write(self, text: str) -> int:
+        if text:
+            self._cb(text)
+        return len(text)
+
+    def flush(self):
+        pass
+
+
+class LoadExtractionApp:
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.root.title("OP2 / H5 Dosya Birleştirici")
+        self.root.resizable(True, True)
+        self.file_type = tk.StringVar(value="op2")
+        self.conflict_mode = tk.StringVar(value="prefix")
+        self._build_ui()
+
+    # ── UI ──────────────────────────────────────
+
+    def _build_ui(self):
+        pad = {"padx": 8, "pady": 4}
+
+        # Dosya türü
+        type_frame = ttk.LabelFrame(self.root, text="Dosya Türü")
+        type_frame.pack(fill="x", **pad)
+        for label, val in [("OP2 (.op2) — Nastran", "op2"), ("H5 (.h5) — HDF5", "h5")]:
+            ttk.Radiobutton(
+                type_frame, text=label, variable=self.file_type,
+                value=val, command=self._on_type_change
+            ).pack(side="left", padx=12, pady=4)
+
+        # Dosya listesi
+        list_frame = ttk.LabelFrame(self.root, text="Birleştirilecek Dosyalar")
+        list_frame.pack(fill="both", expand=True, **pad)
+
+        btn_bar = ttk.Frame(list_frame)
+        btn_bar.pack(fill="x", padx=4, pady=2)
+        ttk.Button(btn_bar, text="Ekle...", command=self._add_files).pack(side="left", padx=2)
+        ttk.Button(btn_bar, text="Kaldır", command=self._remove_selected).pack(side="left", padx=2)
+
+        sb = ttk.Scrollbar(list_frame, orient="vertical")
+        self.listbox = tk.Listbox(list_frame, selectmode="extended", yscrollcommand=sb.set, height=6)
+        sb.config(command=self.listbox.yview)
+        sb.pack(side="right", fill="y", padx=(0, 4))
+        self.listbox.pack(fill="both", expand=True, padx=(4, 0), pady=4)
+
+        # Çıktı
+        out_frame = ttk.LabelFrame(self.root, text="Çıktı Dosyası")
+        out_frame.pack(fill="x", **pad)
+        self.out_var = tk.StringVar()
+        ttk.Entry(out_frame, textvariable=self.out_var).pack(side="left", fill="x", expand=True, padx=4, pady=4)
+        ttk.Button(out_frame, text="Gözat...", command=self._browse_output).pack(side="right", padx=4, pady=4)
+
+        # H5 çakışma modu (başlangıçta gizli)
+        self.conflict_frame = ttk.LabelFrame(self.root, text="H5 Çakışma Modu")
+        for label, val in [("prefix (önerilen)", "prefix"), ("skip", "skip"),
+                           ("overwrite", "overwrite"), ("rename", "rename")]:
+            ttk.Radiobutton(
+                self.conflict_frame, text=label,
+                variable=self.conflict_mode, value=val
+            ).pack(side="left", padx=8, pady=4)
+
+        # Birleştir butonu
+        self.run_btn = ttk.Button(self.root, text="Birleştir", command=self._start)
+        self.run_btn.pack(pady=6)
+
+        # Log alanı
+        log_frame = ttk.LabelFrame(self.root, text="İlerleme")
+        log_frame.pack(fill="both", expand=True, **pad)
+        log_sb = ttk.Scrollbar(log_frame)
+        self.log_text = tk.Text(log_frame, height=10, state="disabled",
+                                yscrollcommand=log_sb.set, wrap="word")
+        log_sb.config(command=self.log_text.yview)
+        log_sb.pack(side="right", fill="y")
+        self.log_text.pack(fill="both", expand=True, padx=4, pady=4)
+
+        self.root.minsize(520, 480)
+
+    # ── Olaylar ─────────────────────────────────
+
+    def _on_type_change(self):
+        if self.file_type.get() == "h5":
+            self.conflict_frame.pack(fill="x", padx=8, pady=4,
+                                     before=self.run_btn)
+        else:
+            self.conflict_frame.pack_forget()
+
+    def _add_files(self):
+        ext = self.file_type.get()
+        paths = filedialog.askopenfilenames(
+            title="Dosya Seç",
+            filetypes=[(f"{ext.upper()} Dosyaları", f"*.{ext}"), ("Tüm Dosyalar", "*.*")]
+        )
+        existing = list(self.listbox.get(0, "end"))
+        for p in paths:
+            if p not in existing:
+                self.listbox.insert("end", p)
+
+    def _remove_selected(self):
+        for idx in reversed(self.listbox.curselection()):
+            self.listbox.delete(idx)
+
+    def _browse_output(self):
+        ext = self.file_type.get()
+        path = filedialog.asksaveasfilename(
+            title="Çıktı Dosyası",
+            defaultextension=f".{ext}",
+            filetypes=[(f"{ext.upper()} Dosyaları", f"*.{ext}")]
+        )
+        if path:
+            self.out_var.set(path)
+
+    # ── Çalıştırma ──────────────────────────────
+
+    def _start(self):
+        files = list(self.listbox.get(0, "end"))
+        output = self.out_var.get().strip()
+
+        if len(files) < 2:
+            messagebox.showwarning("Uyarı", "En az 2 dosya eklemelisiniz.")
+            return
+        if not output:
+            messagebox.showwarning("Uyarı", "Çıktı dosyası belirtilmedi.")
+            return
+        if os.path.exists(output):
+            if not messagebox.askyesno("Üzerine Yaz?",
+                                       f"{os.path.basename(output)} zaten var.\nÜzerine yazılsın mı?"):
+                return
+
+        self.run_btn.config(state="disabled")
+        self._clear_log()
+        threading.Thread(target=self._run, args=(files, output), daemon=True).start()
+
+    def _run(self, files: list[str], output: str):
+        old_stdout = sys.stdout
+        sys.stdout = _PrintRedirector(self._log)
+        try:
+            if self.file_type.get() == "op2":
+                combine_op2(files, output)
+            else:
+                combine_h5(files, output, conflict_mode=self.conflict_mode.get())
+        except Exception as exc:
+            self._log(f"\nHATA: {exc}\n")
+        finally:
+            sys.stdout = old_stdout
+            self.root.after(0, lambda: self.run_btn.config(state="normal"))
+
+    # ── Log yardımcıları ────────────────────────
+
+    def _log(self, msg: str):
+        def _append():
+            self.log_text.config(state="normal")
+            self.log_text.insert("end", msg)
+            self.log_text.see("end")
+            self.log_text.config(state="disabled")
+        self.root.after(0, _append)
+
+    def _clear_log(self):
+        self.log_text.config(state="normal")
+        self.log_text.delete("1.0", "end")
+        self.log_text.config(state="disabled")
+
+
+if __name__ == '__main__':
+    root = tk.Tk()
+    app = LoadExtractionApp(root)
+    root.mainloop()
