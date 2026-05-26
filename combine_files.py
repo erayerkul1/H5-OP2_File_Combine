@@ -331,155 +331,185 @@ def _find_all_domains_paths(h5file) -> list[str]:
     return paths
 
 
-def _replace_dataset(h5file, path: str, new_data) -> None:
-    """Var olan dataset'i sil ve aynı yola yeni veriyi yaz; attribute'ları koru."""
-    attrs = {}
-    if path in h5file:
-        for k, v in h5file[path].attrs.items():
-            attrs[k] = v
-        del h5file[path]
-
-    parent = '/'.join(path.split('/')[:-1])
-    if parent:
-        h5file.require_group(parent)
-
-    ds = h5file.create_dataset(path, data=new_data)
-    for k, v in attrs.items():
-        try:
-            ds.attrs[k] = v
-        except Exception:
-            pass
+def _get_create_kwargs(dataset) -> dict:
+    """
+    Var olan bir dataset'in sıkıştırma / chunk ayarlarını döner.
+    Yeni (daha büyük) dataset oluştururken aynı ayarları kullanmak için.
+    """
+    kwargs = {}
+    if dataset.compression:
+        kwargs['compression'] = dataset.compression
+        if dataset.compression_opts is not None:
+            kwargs['compression_opts'] = dataset.compression_opts
+    if dataset.chunks is not None:
+        # Orijinal chunk boyutunu koru — h5py yeni boyutu otomatik ayarlar
+        kwargs['chunks'] = True
+    return kwargs
 
 
 def combine_h5_nastran(input_files: list[str], output_path: str) -> None:
     """
     MSC Nastran native H5 dosyalarını DOMAIN_ID offset yöntemiyle birleştirir.
 
-    Algoritma
-    ─────────
-    1. İlk dosyayı olduğu gibi çıktıya kopyala (geometri + 1. subcase seti).
-    2. Sonraki her dosya için:
-       a. Çıktıdaki DOMAINS dataset'lerinin maksimum ID'sini bul.
-       b. Kaynak dosyanın DOMAINS dataset'lerinin minimum ID'sini bul.
-       c. offset = max_out_id - min_src_id + 1
-       d. 'DOMAIN_ID' alanı olan her dataset → DOMAIN_ID değerlerini offset'le,
-          çıktıdakiyle birleştir (np.concatenate).
-       e. DOMAINS dataset'leri → ID alanını offset'le, birleştir.
-       f. Diğer dataset'ler (geometri) → atla.
-    3. INDEX grubu çıktıdan kaldırılır (birleştirme sonrası geçersiz kalır;
-       HyperView açılışta yeniden oluşturur).
+    Neden iki aşama?
+    ────────────────
+    "copy-then-modify" (shutil.copy2 + del+create) iki sorun yaratır:
+      1. Sıkıştırma kaybı  — del sonrası create_dataset sıkıştırmayı unutur;
+         gzip ile 4:1 sıkışmış 72 MB dosya 280+ MB'a çıkabilir.
+      2. HDF5 parçalanması — del işlemi alanı sisteme iade etmez; eski veri
+         "hayalet" olarak dosyada kalır, boyut şişer.
+
+    Çözüm — Topla → Sıfırdan Yaz
+    ─────────────────────────────
+    Aşama 1: Tüm dosyaları RAM'e oku.
+      • Geometri dataset'leri: yalnızca ilk dosyadan.
+      • Sonuç dataset'leri (DOMAIN_ID veya DOMAINS): tüm dosyalardan,
+        offset uygulanarak.
+    Aşama 2: Çıktıyı sıfırdan oluştur; her dataset tek seferinde, orijinal
+      sıkıştırma/chunk ayarlarıyla yaz → parçalanma yok, boyut minimal.
     """
     import h5py
     import numpy as np
-    import shutil
 
     print(f"\n{len(input_files)} adet MSC Nastran H5 dosyası birleştiriliyor "
           f"(domain-ID modu)...")
 
-    # 1. İlk dosyayı temel al
-    print(f"  [1/{len(input_files)}] Temel alınıyor: {os.path.basename(input_files[0])}")
-    shutil.copy2(input_files[0], output_path)
-    base_mb = os.path.getsize(output_path) / (1024 * 1024)
-    print(f"    → {base_mb:.1f} MB kopyalandı")
+    # ── Aşama 1: Topla ──────────────────────────────────────────────────────
+    # collected[path] = {'arrays': [...], 'attrs': {}, 'ckw': {}}
+    # group_attrs[path] = {attr_name: value}
+    collected: dict = {}
+    group_attrs: dict = {}
+    current_max_id = 0   # çıktıda şimdiye kadar yazılan en büyük DOMAIN ID
 
-    # 2. Sonraki dosyaları birleştir
-    for file_idx, filepath in enumerate(input_files[1:], start=2):
-        print(f"  [{file_idx}/{len(input_files)}] Birleştiriliyor: "
-              f"{os.path.basename(filepath)}")
+    for file_idx, filepath in enumerate(input_files):
+        label = os.path.basename(filepath)
+        print(f"  [{file_idx+1}/{len(input_files)}] Okunuyor: {label}", end="", flush=True)
 
-        with h5py.File(output_path, 'r+') as out_f, \
-             h5py.File(filepath, 'r') as src_f:
+        with h5py.File(filepath, 'r') as src_f:
+            # Kök attribute'ları ilk dosyadan sakla
+            if file_idx == 0:
+                collected['__root_attrs__'] = dict(src_f.attrs)
 
-            # DOMAINS yollarını bul
-            out_domains_paths = _find_all_domains_paths(out_f)
-            src_domains_paths = _find_all_domains_paths(src_f)
-
-            if not out_domains_paths:
-                # Nastran H5 yapısı yoksa deep_merge'e geri dön
-                print("    UYARI: DOMAINS bulunamadı → deep_merge kullanılıyor")
-                counters = [0]
-                _h5_deep_merge(src_f, out_f, "/", "/", file_idx - 1, counters)
-                print(f"    → {counters[0]} dataset eklendi")
-                continue
-
-            # max_out_id: çıktıdaki en büyük DOMAIN ID
-            max_out_id = 0
-            for dp in out_domains_paths:
-                d = out_f[dp][()]
-                if len(d) > 0:
-                    max_out_id = max(max_out_id, int(d['ID'].max()))
-
-            # min_src_id: kaynak dosyadaki en küçük DOMAIN ID
+            # Bu dosyanın minimum DOMAIN ID'sini bul (offset hesabı için)
+            src_dp = _find_all_domains_paths(src_f)
             min_src_id = 1
-            if src_domains_paths:
-                for dp in src_domains_paths:
-                    d = src_f[dp][()]
-                    if len(d) > 0:
-                        min_src_id = min(min_src_id, int(d['ID'].min()))
+            for dp in src_dp:
+                d = src_f[dp][()]
+                if len(d) > 0:
+                    min_src_id = min(min_src_id, int(d['ID'].min()))
 
-            domain_offset = max_out_id - min_src_id + 1
-            print(f"    → DOMAIN_ID offset: +{domain_offset} "
-                  f"(mevcut max: {max_out_id})")
+            domain_offset = (current_max_id - min_src_id + 1) if current_max_id > 0 else 0
 
-            datasets_merged = [0]
+            # Bu dosyanın maksimum DOMAIN ID'sini (offset sonrası) güncelle
+            for dp in src_dp:
+                d = src_f[dp][()]
+                if len(d) > 0:
+                    current_max_id = max(
+                        current_max_id,
+                        int(d['ID'].max()) + domain_offset,
+                    )
 
-            def _merge_ds(name, obj):
-                if not isinstance(obj, h5py.Dataset):
-                    return
+            ds_read = [0]
 
-                # INDEX grubunu atla — birleştirme sonrası geçersiz kalır
+            def _read_item(name, obj, _fi=file_idx, _off=domain_offset):
+                # INDEX grubunu atla — birleştirme sonrası geçersiz
                 if name == 'INDEX' or name.startswith('INDEX/'):
                     return
 
+                if isinstance(obj, h5py.Group):
+                    if _fi == 0:
+                        ga = dict(obj.attrs)
+                        if ga:
+                            group_attrs[name] = ga
+                    return
+
+                # Dataset sınıflandır
                 base_name = name.split('/')[-1]
-                dt_names = obj.dtype.names  # None → düz (non-compound) dtype
+                dt_names = obj.dtype.names
 
                 is_domains_ds = (
                     base_name == 'DOMAINS'
                     and dt_names is not None
                     and 'ID' in dt_names
                 )
-                has_domain_id = (
-                    dt_names is not None
-                    and 'DOMAIN_ID' in dt_names
-                )
+                has_domain_id = dt_names is not None and 'DOMAIN_ID' in dt_names
+                is_result = is_domains_ds or has_domain_id
 
-                if not is_domains_ds and not has_domain_id:
-                    # Geometri / yapısal meta-veri → atla
+                # Geometri sadece ilk dosyadan alınır
+                if _fi > 0 and not is_result:
                     return
 
                 src_data = obj[()]
-                new_data = src_data.copy()
 
-                if is_domains_ds:
-                    new_data['ID'] = src_data['ID'] + domain_offset
-                    if 'DOMAIN_ID' in dt_names:
-                        new_data['DOMAIN_ID'] = (
-                            src_data['DOMAIN_ID'] + domain_offset)
+                # DOMAIN ID'leri offset'le
+                if is_result and _off != 0:
+                    new_data = src_data.copy()
+                    if is_domains_ds:
+                        new_data['ID'] = src_data['ID'] + _off
+                        if 'DOMAIN_ID' in dt_names:
+                            new_data['DOMAIN_ID'] = src_data['DOMAIN_ID'] + _off
+                    else:
+                        new_data['DOMAIN_ID'] = src_data['DOMAIN_ID'] + _off
                 else:
-                    new_data['DOMAIN_ID'] = (
-                        src_data['DOMAIN_ID'] + domain_offset)
+                    new_data = src_data
 
-                if name in out_f:
-                    existing = out_f[name][()]
-                    combined = np.concatenate([existing, new_data])
-                    _replace_dataset(out_f, name, combined)
+                if name not in collected:
+                    collected[name] = {
+                        'arrays': [new_data],
+                        'attrs': dict(obj.attrs),
+                        'ckw': _get_create_kwargs(obj),
+                    }
                 else:
-                    # Çıktıda olmayan yeni sonuç türü → oluştur
-                    parent = '/'.join(name.split('/')[:-1])
-                    if parent and parent not in out_f:
-                        out_f.require_group(parent)
-                    out_f.create_dataset(name, data=new_data)
+                    collected[name]['arrays'].append(new_data)
 
-                datasets_merged[0] += 1
+                ds_read[0] += 1
 
-            src_f.visititems(_merge_ds)
-            print(f"    → {datasets_merged[0]} dataset birleştirildi")
+            src_f.visititems(_read_item)
+            print(f"  → {ds_read[0]} dataset okundu (offset: +{domain_offset})")
 
-            # Geçersiz kalan INDEX grubunu temizle
-            if 'INDEX' in out_f:
-                del out_f['INDEX']
-                print("    → INDEX grubu temizlendi")
+    # ── Aşama 2: Sıfırdan Yaz ───────────────────────────────────────────────
+    print(f"\n  Çıktı yazılıyor: {os.path.basename(output_path)}")
+
+    with h5py.File(output_path, 'w') as out_f:
+        # Kök attribute'lar
+        for k, v in collected.pop('__root_attrs__', {}).items():
+            try:
+                out_f.attrs[k] = v
+            except Exception:
+                pass
+
+        # Grup attribute'ları
+        for grp_path, attrs in group_attrs.items():
+            g = out_f.require_group(grp_path)
+            for k, v in attrs.items():
+                try:
+                    g.attrs[k] = v
+                except Exception:
+                    pass
+
+        # Dataset'leri yaz (tek seferinde, orijinal sıkıştırmayla)
+        written = 0
+        for path, info in collected.items():
+            arrays = info['arrays']
+            data = np.concatenate(arrays) if len(arrays) > 1 else arrays[0]
+
+            parent = '/'.join(path.split('/')[:-1])
+            if parent and parent not in out_f:
+                out_f.require_group(parent)
+
+            try:
+                ds = out_f.create_dataset(path, data=data, **info['ckw'])
+            except Exception:
+                ds = out_f.create_dataset(path, data=data)
+
+            for k, v in info['attrs'].items():
+                try:
+                    ds.attrs[k] = v
+                except Exception:
+                    pass
+            written += 1
+
+        print(f"    → {written} dataset yazıldı")
 
     size_mb = os.path.getsize(output_path) / (1024 * 1024)
     print(f"\n✓ Tamamlandı: {output_path} ({size_mb:.2f} MB)")
