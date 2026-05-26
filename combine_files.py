@@ -423,6 +423,16 @@ def combine_h5_nastran(input_files: list[str], output_path: str) -> None:
                             group_attrs[name] = ga
                     return
 
+                # ── Dosya 2+ için yol filtresi ─────────────────────────────
+                # Yalnızca kök RESULT/ altındaki dataset'ler birleştirilir.
+                #
+                # NASTRAN/ bölümü (INPUT + RESULT/şablonlar) model tanımıdır;
+                # DOMAIN_ID alanı olsa bile birden fazla yazılırsa HyperView
+                # "Duplicate element id" hatası verir.  Bu nedenle NASTRAN/
+                # her zaman yalnızca ilk dosyadan alınır.
+                if _fi > 0 and not name.startswith('RESULT/'):
+                    return
+
                 # Dataset sınıflandır
                 base_name = name.split('/')[-1]
                 dt_names = obj.dtype.names
@@ -435,7 +445,8 @@ def combine_h5_nastran(input_files: list[str], output_path: str) -> None:
                 has_domain_id = dt_names is not None and 'DOMAIN_ID' in dt_names
                 is_result = is_domains_ds or has_domain_id
 
-                # Geometri sadece ilk dosyadan alınır
+                # RESULT/ altında bile DOMAIN_ID olmayan dataset'ler (nadiren
+                # görülen config satırları) dosya 1'den alınır; sonrakilerden atlanır.
                 if _fi > 0 and not is_result:
                     return
 
