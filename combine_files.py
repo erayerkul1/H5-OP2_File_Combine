@@ -223,27 +223,20 @@ def _copy_attrs(src_grp, dst_grp) -> None:
 def _h5_deep_merge(src_file, dst_file, src_grp_path: str, dst_grp_path: str,
                    file_idx: int, counters: list) -> None:
     """
-    Özyinelemeli H5 birleştirme — HyperView / Nastran uyumlu.
-
-    İki basit kural:
+    Özyinelemeli H5 birleştirme — genel HDF5 dosyaları için.
 
     GRUPLAR
     ───────
     • Hedefte yok          → her zaman kopyala
     • Hedefte var + sayısal suffix (SUBCASE_N, LC_N …)
                            → grubu KOMPLE yeni sıralı isimle kopyala
-    • Hedefte var + sayısal suffix yok (RESULTS, NODAL, INPUT …)
+    • Hedefte var + sayısal suffix yok
                            → her zaman özyinelemeli birleştir
-                             (_has_subcase_descendants kontrolü YOK —
-                              depth sınırı sorununu giderir)
 
     DATASET'LER
     ───────────
     • Hedefte yok          → kopyala
-    • Hedefte var          → ATLA
-                             (geometri datası — düğüm/eleman koordinatları —
-                              her dosyada aynı; kopyalamak "Duplicate element id"
-                              hatasına yol açar)
+    • Hedefte var          → ATLA (geometri datası)
     """
     import h5py
 
@@ -259,12 +252,10 @@ def _h5_deep_merge(src_file, dst_file, src_grp_path: str, dst_grp_path: str,
             has_numeric_suffix = bool(_SUBCASE_RE.match(name))
 
             if dst_child not in dst_file:
-                # ── Hedefte yok → her zaman kopyala ────────────────────────
                 src_file.copy(src_child, dst_file, name=dst_child)
                 counters[0] += _count_datasets(item)
 
             elif has_numeric_suffix:
-                # ── Subcase çakışıyor → yeni sıralı isim ver ───────────────
                 new_name = _next_available_name(dst_parent_grp, name)
                 if new_name is None:
                     new_name = name + f"_f{file_idx + 1}"
@@ -279,14 +270,12 @@ def _h5_deep_merge(src_file, dst_file, src_grp_path: str, dst_grp_path: str,
                 counters[0] += _count_datasets(item)
 
             else:
-                # ── Ara grup (RESULTS, NODAL, INPUT …) → her zaman özyinele ─
                 _copy_attrs(item, dst_file[dst_child])
                 _h5_deep_merge(src_file, dst_file, src_child, dst_child,
                                file_idx, counters)
 
         elif isinstance(item, h5py.Dataset):
             if dst_child not in dst_file:
-                # ── Yeni dataset → kopyala ──────────────────────────────────
                 src_file.copy(src_child, dst_file, name=dst_child)
                 counters[0] += 1
             # else: var olan dataset (geometri) → atla
@@ -303,6 +292,199 @@ def _count_datasets(grp) -> int:
     return count[0]
 
 
+# ── MSC Nastran H5 (domain-ID) birleştirme ─────────────────────────────────
+
+def _is_nastran_h5(h5file) -> bool:
+    """
+    MSC Nastran native H5 formatını tanır.
+    Kriter: 'ID' alanı olan bir DOMAINS dataset'i varsa Nastran H5'tir.
+    """
+    import h5py
+    found = [False]
+
+    def _visit(name, obj):
+        if found[0]:
+            return
+        if (isinstance(obj, h5py.Dataset)
+                and name.split('/')[-1] == 'DOMAINS'
+                and obj.dtype.names is not None
+                and 'ID' in obj.dtype.names):
+            found[0] = True
+
+    h5file.visititems(_visit)
+    return found[0]
+
+
+def _find_all_domains_paths(h5file) -> list[str]:
+    """Dosyadaki tüm DOMAINS dataset yollarını bulur."""
+    import h5py
+    paths = []
+
+    def _visit(name, obj):
+        if (isinstance(obj, h5py.Dataset)
+                and name.split('/')[-1] == 'DOMAINS'
+                and obj.dtype.names is not None
+                and 'ID' in obj.dtype.names):
+            paths.append(name)
+
+    h5file.visititems(_visit)
+    return paths
+
+
+def _replace_dataset(h5file, path: str, new_data) -> None:
+    """Var olan dataset'i sil ve aynı yola yeni veriyi yaz; attribute'ları koru."""
+    attrs = {}
+    if path in h5file:
+        for k, v in h5file[path].attrs.items():
+            attrs[k] = v
+        del h5file[path]
+
+    parent = '/'.join(path.split('/')[:-1])
+    if parent:
+        h5file.require_group(parent)
+
+    ds = h5file.create_dataset(path, data=new_data)
+    for k, v in attrs.items():
+        try:
+            ds.attrs[k] = v
+        except Exception:
+            pass
+
+
+def combine_h5_nastran(input_files: list[str], output_path: str) -> None:
+    """
+    MSC Nastran native H5 dosyalarını DOMAIN_ID offset yöntemiyle birleştirir.
+
+    Algoritma
+    ─────────
+    1. İlk dosyayı olduğu gibi çıktıya kopyala (geometri + 1. subcase seti).
+    2. Sonraki her dosya için:
+       a. Çıktıdaki DOMAINS dataset'lerinin maksimum ID'sini bul.
+       b. Kaynak dosyanın DOMAINS dataset'lerinin minimum ID'sini bul.
+       c. offset = max_out_id - min_src_id + 1
+       d. 'DOMAIN_ID' alanı olan her dataset → DOMAIN_ID değerlerini offset'le,
+          çıktıdakiyle birleştir (np.concatenate).
+       e. DOMAINS dataset'leri → ID alanını offset'le, birleştir.
+       f. Diğer dataset'ler (geometri) → atla.
+    3. INDEX grubu çıktıdan kaldırılır (birleştirme sonrası geçersiz kalır;
+       HyperView açılışta yeniden oluşturur).
+    """
+    import h5py
+    import numpy as np
+    import shutil
+
+    print(f"\n{len(input_files)} adet MSC Nastran H5 dosyası birleştiriliyor "
+          f"(domain-ID modu)...")
+
+    # 1. İlk dosyayı temel al
+    print(f"  [1/{len(input_files)}] Temel alınıyor: {os.path.basename(input_files[0])}")
+    shutil.copy2(input_files[0], output_path)
+    base_mb = os.path.getsize(output_path) / (1024 * 1024)
+    print(f"    → {base_mb:.1f} MB kopyalandı")
+
+    # 2. Sonraki dosyaları birleştir
+    for file_idx, filepath in enumerate(input_files[1:], start=2):
+        print(f"  [{file_idx}/{len(input_files)}] Birleştiriliyor: "
+              f"{os.path.basename(filepath)}")
+
+        with h5py.File(output_path, 'r+') as out_f, \
+             h5py.File(filepath, 'r') as src_f:
+
+            # DOMAINS yollarını bul
+            out_domains_paths = _find_all_domains_paths(out_f)
+            src_domains_paths = _find_all_domains_paths(src_f)
+
+            if not out_domains_paths:
+                # Nastran H5 yapısı yoksa deep_merge'e geri dön
+                print("    UYARI: DOMAINS bulunamadı → deep_merge kullanılıyor")
+                counters = [0]
+                _h5_deep_merge(src_f, out_f, "/", "/", file_idx - 1, counters)
+                print(f"    → {counters[0]} dataset eklendi")
+                continue
+
+            # max_out_id: çıktıdaki en büyük DOMAIN ID
+            max_out_id = 0
+            for dp in out_domains_paths:
+                d = out_f[dp][()]
+                if len(d) > 0:
+                    max_out_id = max(max_out_id, int(d['ID'].max()))
+
+            # min_src_id: kaynak dosyadaki en küçük DOMAIN ID
+            min_src_id = 1
+            if src_domains_paths:
+                for dp in src_domains_paths:
+                    d = src_f[dp][()]
+                    if len(d) > 0:
+                        min_src_id = min(min_src_id, int(d['ID'].min()))
+
+            domain_offset = max_out_id - min_src_id + 1
+            print(f"    → DOMAIN_ID offset: +{domain_offset} "
+                  f"(mevcut max: {max_out_id})")
+
+            datasets_merged = [0]
+
+            def _merge_ds(name, obj):
+                if not isinstance(obj, h5py.Dataset):
+                    return
+
+                # INDEX grubunu atla — birleştirme sonrası geçersiz kalır
+                if name == 'INDEX' or name.startswith('INDEX/'):
+                    return
+
+                base_name = name.split('/')[-1]
+                dt_names = obj.dtype.names  # None → düz (non-compound) dtype
+
+                is_domains_ds = (
+                    base_name == 'DOMAINS'
+                    and dt_names is not None
+                    and 'ID' in dt_names
+                )
+                has_domain_id = (
+                    dt_names is not None
+                    and 'DOMAIN_ID' in dt_names
+                )
+
+                if not is_domains_ds and not has_domain_id:
+                    # Geometri / yapısal meta-veri → atla
+                    return
+
+                src_data = obj[()]
+                new_data = src_data.copy()
+
+                if is_domains_ds:
+                    new_data['ID'] = src_data['ID'] + domain_offset
+                    if 'DOMAIN_ID' in dt_names:
+                        new_data['DOMAIN_ID'] = (
+                            src_data['DOMAIN_ID'] + domain_offset)
+                else:
+                    new_data['DOMAIN_ID'] = (
+                        src_data['DOMAIN_ID'] + domain_offset)
+
+                if name in out_f:
+                    existing = out_f[name][()]
+                    combined = np.concatenate([existing, new_data])
+                    _replace_dataset(out_f, name, combined)
+                else:
+                    # Çıktıda olmayan yeni sonuç türü → oluştur
+                    parent = '/'.join(name.split('/')[:-1])
+                    if parent and parent not in out_f:
+                        out_f.require_group(parent)
+                    out_f.create_dataset(name, data=new_data)
+
+                datasets_merged[0] += 1
+
+            src_f.visititems(_merge_ds)
+            print(f"    → {datasets_merged[0]} dataset birleştirildi")
+
+            # Geçersiz kalan INDEX grubunu temizle
+            if 'INDEX' in out_f:
+                del out_f['INDEX']
+                print("    → INDEX grubu temizlendi")
+
+    size_mb = os.path.getsize(output_path) / (1024 * 1024)
+    print(f"\n✓ Tamamlandı: {output_path} ({size_mb:.2f} MB)")
+
+
 def combine_h5(input_files: list[str], output_path: str, conflict_mode: str | None = None) -> None:
     try:
         import h5py
@@ -310,6 +492,19 @@ def combine_h5(input_files: list[str], output_path: str, conflict_mode: str | No
         print("HATA: h5py kurulu değil. Kurmak için: pip install h5py")
         sys.exit(1)
 
+    # MSC Nastran H5 formatını otomatik tanı
+    try:
+        with h5py.File(input_files[0], 'r') as _f:
+            _nastran = _is_nastran_h5(_f)
+    except Exception:
+        _nastran = False
+
+    if _nastran:
+        print("ℹ MSC Nastran H5 formatı tespit edildi → domain-ID birleştirme kullanılıyor.")
+        combine_h5_nastran(input_files, output_path)
+        return
+
+    # ── Genel HDF5 birleştirme ──────────────────────────────────────────────
     print(f"\n{len(input_files)} adet H5 dosyası birleştiriliyor...")
 
     if conflict_mode is None:
@@ -320,7 +515,6 @@ def combine_h5(input_files: list[str], output_path: str, conflict_mode: str | No
             print(f"  [{file_idx+1}/{len(input_files)}] İşleniyor: {os.path.basename(filepath)}")
 
             with h5py.File(filepath, "r") as in_file:
-                # Kök attribute'larını kopyala (ilk dosyadan)
                 for k, v in in_file.attrs.items():
                     if k not in out_file.attrs:
                         try:
@@ -331,17 +525,15 @@ def combine_h5(input_files: list[str], output_path: str, conflict_mode: str | No
                 counters = [0]
 
                 if conflict_mode == "deep_merge":
-                    # Kök yapıyı koruyarak özyinelemeli birleştir
                     _h5_deep_merge(in_file, out_file, "/", "/", file_idx, counters)
 
                 elif conflict_mode == "prefix":
-                    # Her dosyanın içeriğini kendi adıyla bir üst grup altına koy
                     file_label = Path(filepath).stem
                     in_file.copy("/", out_file, name=file_label)
                     counters[0] = _count_datasets(in_file)
 
                 else:
-                    # skip / overwrite / rename — düz kopyalama (çakışma yönetimi ile)
+                    # skip / overwrite / rename
                     def _flat_copy(name, obj):
                         if isinstance(obj, h5py.Dataset):
                             dest = name
