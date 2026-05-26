@@ -187,10 +187,89 @@ def _set_nested_attr(obj, dotted_name: str, value) -> None:
 # H5 Birleştirme
 # ──────────────────────────────────────────────
 
+def _h5_deep_merge(src_file, dst_file, src_grp_path: str, dst_grp_path: str,
+                   file_idx: int, counters: list) -> None:
+    """
+    src_file içindeki src_grp_path grubunu dst_file'ın dst_grp_path grubuna
+    özyinelemeli olarak birleştirir.
+
+    Strateji:
+    - Grup yoksa  → tümüyle kopyala (içindeki her şeyle)
+    - Grup varsa  → attribute ekle, içine in ve aynı işlemi tekrarla
+                    ANCAK iç item'lar dataset ise (yaprak grup = sonuç grubu)
+                    grubu bütünüyle _fN adıyla kopyala (HyperView uyumluluğu)
+    - Dataset yoksa → kopyala
+    - Dataset varsa → _fN sonekiyle yeniden adlandır
+    """
+    import h5py
+
+    src_grp = src_file[src_grp_path] if src_grp_path != "/" else src_file
+
+    for name, item in src_grp.items():
+        src_child = f"{src_grp_path.rstrip('/')}/{name}".lstrip("/")
+        dst_child = f"{dst_grp_path.rstrip('/')}/{name}".lstrip("/")
+
+        if isinstance(item, h5py.Group):
+            if dst_child not in dst_file:
+                # Hedefte hiç yok → tümünü tek seferde kopyala
+                src_file.copy(src_child, dst_file, name=dst_child)
+                counters[0] += _count_datasets(item)
+            else:
+                # Hedefte var → bu grubun "yaprak grup" (leaf group) olup
+                # olmadığını kontrol et: içindeki tüm çocuklar dataset ise
+                # grubu bütünüyle _fN adıyla kopyala; değilse içine gir.
+                all_children_are_datasets = all(
+                    isinstance(item[child], h5py.Dataset) for child in item
+                )
+                if all_children_are_datasets:
+                    # Yaprak grup (örn. SUBCASE_1) → grubu bütünüyle rename et
+                    suffix = 2
+                    candidate = f"{dst_child}_f{file_idx + 1}"
+                    while candidate in dst_file:
+                        candidate = f"{dst_child}_f{file_idx + 1}_{suffix}"
+                        suffix += 1
+                    src_file.copy(src_child, dst_file, name=candidate)
+                    counters[0] += _count_datasets(item)
+                else:
+                    # Ara grup → attribute'ları ekle ve içine in
+                    for k, v in item.attrs.items():
+                        if k not in dst_file[dst_child].attrs:
+                            try:
+                                dst_file[dst_child].attrs[k] = v
+                            except Exception:
+                                pass
+                    _h5_deep_merge(src_file, dst_file, src_child, dst_child,
+                                   file_idx, counters)
+
+        elif isinstance(item, h5py.Dataset):
+            if dst_child not in dst_file:
+                src_file.copy(src_child, dst_file, name=dst_child)
+                counters[0] += 1
+            else:
+                # Çakışan dataset → _fN sonekiyle yeniden adlandır
+                suffix = 2
+                candidate = f"{dst_child}_f{file_idx + 1}"
+                while candidate in dst_file:
+                    candidate = f"{dst_child}_f{file_idx + 1}_{suffix}"
+                    suffix += 1
+                src_file.copy(src_child, dst_file, name=candidate)
+                counters[0] += 1
+
+
+def _count_datasets(grp) -> int:
+    """Bir grup içindeki toplam dataset sayısını döner."""
+    import h5py
+    count = [0]
+    def _visit(name, obj):
+        if isinstance(obj, h5py.Dataset):
+            count[0] += 1
+    grp.visititems(_visit)
+    return count[0]
+
+
 def combine_h5(input_files: list[str], output_path: str, conflict_mode: str | None = None) -> None:
     try:
         import h5py
-        import numpy as np
     except ImportError:
         print("HATA: h5py kurulu değil. Kurmak için: pip install h5py")
         sys.exit(1)
@@ -202,75 +281,80 @@ def combine_h5(input_files: list[str], output_path: str, conflict_mode: str | No
 
     with h5py.File(output_path, "w") as out_file:
         for file_idx, filepath in enumerate(input_files):
-            file_label = Path(filepath).stem
             print(f"  [{file_idx+1}/{len(input_files)}] İşleniyor: {os.path.basename(filepath)}")
 
             with h5py.File(filepath, "r") as in_file:
-                item_count = [0]
+                # Kök attribute'larını kopyala (ilk dosyadan)
+                for k, v in in_file.attrs.items():
+                    if k not in out_file.attrs:
+                        try:
+                            out_file.attrs[k] = v
+                        except Exception:
+                            pass
 
-                def _copy_item(name, obj):
-                    if conflict_mode == "prefix":
-                        dest_name = f"{file_label}/{name}"
-                    else:
-                        dest_name = name
+                counters = [0]
 
-                    if isinstance(obj, h5py.Dataset):
-                        if dest_name in out_file:
-                            if conflict_mode == "skip":
-                                return
-                            elif conflict_mode == "overwrite":
-                                del out_file[dest_name]
-                            elif conflict_mode == "rename":
-                                dest_name = f"{dest_name}_file{file_idx+1}"
+                if conflict_mode == "deep_merge":
+                    # Kök yapıyı koruyarak özyinelemeli birleştir
+                    _h5_deep_merge(in_file, out_file, "/", "/", file_idx, counters)
 
-                        # Grubun üst yolunu oluştur
-                        parent = "/".join(dest_name.split("/")[:-1])
-                        if parent and parent not in out_file:
-                            out_file.require_group(parent)
+                elif conflict_mode == "prefix":
+                    # Her dosyanın içeriğini kendi adıyla bir üst grup altına koy
+                    file_label = Path(filepath).stem
+                    in_file.copy("/", out_file, name=file_label)
+                    counters[0] = _count_datasets(in_file)
 
-                        in_file.copy(name, out_file, name=dest_name)
-                        item_count[0] += 1
+                else:
+                    # skip / overwrite / rename — düz kopyalama (çakışma yönetimi ile)
+                    def _flat_copy(name, obj):
+                        if isinstance(obj, h5py.Dataset):
+                            dest = name
+                            if dest in out_file:
+                                if conflict_mode == "skip":
+                                    return
+                                elif conflict_mode == "overwrite":
+                                    del out_file[dest]
+                                elif conflict_mode == "rename":
+                                    dest = f"{name}_f{file_idx+1}"
+                            parent = "/".join(dest.split("/")[:-1])
+                            if parent and parent not in out_file:
+                                out_file.require_group(parent)
+                            in_file.copy(name, out_file, name=dest)
+                            counters[0] += 1
+                        elif isinstance(obj, h5py.Group):
+                            dest = name
+                            if dest not in out_file:
+                                out_file.require_group(dest)
+                            src_g = in_file[name]
+                            dst_g = out_file[dest]
+                            for k, v in src_g.attrs.items():
+                                if k not in dst_g.attrs:
+                                    try:
+                                        dst_g.attrs[k] = v
+                                    except Exception:
+                                        pass
+                    in_file.visititems(_flat_copy)
 
-                    elif isinstance(obj, h5py.Group):
-                        if conflict_mode != "prefix":
-                            out_file.require_group(dest_name)
-                            # Grup attribute'larını kopyala
-                            src_grp = in_file[name]
-                            dst_grp = out_file[dest_name]
-                            for attr_k, attr_v in src_grp.attrs.items():
-                                if attr_k not in dst_grp.attrs:
-                                    dst_grp.attrs[attr_k] = attr_v
-
-                in_file.visititems(_copy_item)
-                # Kök attribute'larını kopyala
-                for attr_k, attr_v in in_file.attrs.items():
-                    if attr_k not in out_file.attrs:
-                        out_file.attrs[attr_k] = attr_v
-
-                print(f"    → {item_count[0]} dataset eklendi")
+                print(f"    → {counters[0]} dataset eklendi")
 
     size_mb = os.path.getsize(output_path) / (1024 * 1024)
-    print(f"\nTamamlandı: {output_path} ({size_mb:.2f} MB)")
+    print(f"\n✓ Tamamlandı: {output_path} ({size_mb:.2f} MB)")
 
 
 def _ask_conflict_mode() -> str:
-    print("\nAynı isimde dataset'ler çakışırsa ne yapılsın?")
-    print("  1) prefix  - Her dosyanın içeriğini kendi adıyla bir grup altına koy (önerilen)")
-    print("  2) skip    - Var olanı koru, yeni geleni atla")
-    print("  3) overwrite - Yeni gelen eskinin üzerine yaz")
-    print("  4) rename  - Yeni gelene _fileN eki ekle")
+    print("\nBirleştirme modu seçin:")
+    print("  1) deep_merge - Kök yapıyı koru, grupları içten birleştir (HyperView için önerilen)")
+    print("  2) prefix     - Her dosyayı kendi adıyla ayrı bir üst grup altına koy")
+    print("  3) skip       - Var olanı koru, çakışanı atla")
+    print("  4) overwrite  - Çakışanda yeni gelen eskinin üzerine yaz")
+    print("  5) rename     - Çakışana _fN soneki ekle")
     while True:
-        choice = input("Seçiminiz (1-4) [1]: ").strip()
-        if choice in ("", "1"):
-            return "prefix"
-        elif choice == "2":
-            return "skip"
-        elif choice == "3":
-            return "overwrite"
-        elif choice == "4":
-            return "rename"
-        else:
-            print("Lütfen 1-4 arasında bir değer girin.")
+        choice = input("Seçiminiz (1-5) [1]: ").strip()
+        mapping = {"": "deep_merge", "1": "deep_merge", "2": "prefix",
+                   "3": "skip", "4": "overwrite", "5": "rename"}
+        if choice in mapping:
+            return mapping[choice]
+        print("Lütfen 1-5 arasında bir değer girin.")
 
 
 # ──────────────────────────────────────────────
@@ -329,7 +413,7 @@ class LoadExtractionApp:
         self.root.title("OP2 / H5 Dosya Birleştirici")
         self.root.resizable(True, True)
         self.file_type = tk.StringVar(value="op2")
-        self.conflict_mode = tk.StringVar(value="prefix")
+        self.conflict_mode = tk.StringVar(value="deep_merge")
         self._build_ui()
 
     # ── UI ──────────────────────────────────────
@@ -368,14 +452,19 @@ class LoadExtractionApp:
         ttk.Entry(out_frame, textvariable=self.out_var).pack(side="left", fill="x", expand=True, padx=4, pady=4)
         ttk.Button(out_frame, text="Gözat...", command=self._browse_output).pack(side="right", padx=4, pady=4)
 
-        # H5 çakışma modu (başlangıçta gizli)
-        self.conflict_frame = ttk.LabelFrame(self.root, text="H5 Çakışma Modu")
-        for label, val in [("prefix (önerilen)", "prefix"), ("skip", "skip"),
-                           ("overwrite", "overwrite"), ("rename", "rename")]:
+        # H5 birleştirme modu (başlangıçta gizli)
+        self.conflict_frame = ttk.LabelFrame(self.root, text="H5 Birleştirme Modu")
+        for label, val in [
+            ("deep_merge — HyperView uyumlu (önerilen)", "deep_merge"),
+            ("prefix — ayrı üst grup", "prefix"),
+            ("skip", "skip"),
+            ("overwrite", "overwrite"),
+            ("rename", "rename"),
+        ]:
             ttk.Radiobutton(
                 self.conflict_frame, text=label,
                 variable=self.conflict_mode, value=val
-            ).pack(side="left", padx=8, pady=4)
+            ).pack(anchor="w", padx=8, pady=2)
 
         # Birleştir butonu
         self.run_btn = ttk.Button(self.root, text="Birleştir", command=self._start)
