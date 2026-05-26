@@ -297,46 +297,45 @@ def _count_datasets(grp) -> int:
 def _is_nastran_h5(h5file) -> bool:
     """
     MSC Nastran native H5 formatını tanır.
-    Kriter: 'RESULT/DOMAINS' yolunda SUBCASE alanı olan bir dataset varsa.
-    (NASTRAN/INPUT/DOMAINS farklı bir yapıdır — karışmaması için SUBCASE şartı.)
+    RESULT/DOMAINS'e doğrudan erişir — güvenilir, O(1), exception riski yok.
     """
-    import h5py
-    found = [False]
-
-    def _visit(name, obj):
-        if found[0]:
-            return
-        if (isinstance(obj, h5py.Dataset)
-                and name.startswith('RESULT/')
-                and name.split('/')[-1] == 'DOMAINS'
-                and obj.dtype.names is not None
-                and 'ID' in obj.dtype.names
-                and 'SUBCASE' in obj.dtype.names):
-            found[0] = True
-
-    h5file.visititems(_visit)
-    return found[0]
+    try:
+        ds = h5file.get('RESULT/DOMAINS')
+        if ds is not None:
+            dt = getattr(ds, 'dtype', None)
+            if dt is not None and dt.names:
+                return 'ID' in dt.names and 'SUBCASE' in dt.names
+    except Exception:
+        pass
+    return False
 
 
 def _find_all_domains_paths(h5file) -> list[str]:
     """
-    Yalnızca RESULT/DOMAINS tipindeki yolları bulur.
+    RESULT/DOMAINS yolunu doğrudan döndürür.
     NASTRAN/INPUT/DOMAINS (superelement yapısı) dahil edilmez.
     """
-    import h5py
     paths = []
-
-    def _visit(name, obj):
-        if (isinstance(obj, h5py.Dataset)
-                and name.startswith('RESULT/')
-                and name.split('/')[-1] == 'DOMAINS'
-                and obj.dtype.names is not None
-                and 'ID' in obj.dtype.names
-                and 'SUBCASE' in obj.dtype.names):
-            paths.append(name)
-
-    h5file.visititems(_visit)
+    try:
+        ds = h5file.get('RESULT/DOMAINS')
+        if ds is not None:
+            dt = getattr(ds, 'dtype', None)
+            if dt is not None and dt.names and 'ID' in dt.names and 'SUBCASE' in dt.names:
+                paths.append('RESULT/DOMAINS')
+    except Exception:
+        pass
     return paths
+
+
+def _walk_h5(grp, prefix: str = ""):
+    """HDF5 grubundaki tüm (yol, dataset_obj) çiftlerini döndürür."""
+    import h5py
+    for name, obj in grp.items():
+        path = f"{prefix}/{name}" if prefix else name
+        if isinstance(obj, h5py.Dataset):
+            yield path, obj
+        elif isinstance(obj, h5py.Group):
+            yield from _walk_h5(obj, path)
 
 
 def _get_create_kwargs(dataset) -> dict:
@@ -445,86 +444,82 @@ def combine_h5_nastran(input_files: list[str], output_path: str) -> None:
                     current_max_id = max(current_max_id,
                                          int(d['ID'].max()) + off)
 
-            file_rrows: dict = {}   # bu dosyadaki RESULT/ satır sayıları
-            ds_count = [0]
+            # Grup attribute'larını topla (sadece fi == 0)
+            if fi == 0:
+                def _collect_group_attrs(grp, pfx=""):
+                    for n, obj in grp.items():
+                        p = f"{pfx}/{n}" if pfx else n
+                        if isinstance(obj, h5py.Group):
+                            ga = dict(obj.attrs)
+                            if ga:
+                                group_attrs[p] = ga
+                            _collect_group_attrs(obj, p)
+                _collect_group_attrs(src_f)
 
-            def _read(name, obj, _fi=fi, _off=off, _frr=file_rrows):
-                if isinstance(obj, h5py.Group):
-                    if _fi == 0:
-                        ga = dict(obj.attrs)
-                        if ga:
-                            group_attrs[name] = ga
-                    return
+            # Dataset'leri _walk_h5 ile açık döngüde işle — closure yok
+            file_rrows: dict = {}
+            ds_count = 0
 
-                kind = _classify(name, obj)
+            for path, ds in _walk_h5(src_f):
+                if path == 'INDEX' or path.startswith('INDEX/'):
+                    continue
+
+                kind  = _classify(path, ds)
                 if kind == 'skip':
-                    return
+                    continue
 
-                dt   = obj.dtype.names
-                data = obj[()]
-                ckw  = _get_create_kwargs(obj)
-                atts = dict(obj.attrs)
+                dt    = ds.dtype.names
+                data  = ds[()]
+                ckw   = _get_create_kwargs(ds)
+                attrs = dict(ds.attrs)
 
                 # ── geometry: yalnızca dosya 1 ────────────────────────────
                 if kind == 'geometry':
-                    if _fi == 0:
-                        geom[name] = {'array': data, 'attrs': atts, 'ckw': ckw}
-                    ds_count[0] += 1
-                    return
+                    if fi == 0:
+                        geom[path] = {'array': data, 'attrs': attrs, 'ckw': ckw}
 
                 # ── nastran_dom: tüm dosyalardan, DOMAIN_ID offset'li ─────
-                if kind == 'nastran_dom':
+                elif kind == 'nastran_dom':
                     new = data
-                    if _off != 0 and dt and 'DOMAIN_ID' in dt:
+                    if off != 0 and dt and 'DOMAIN_ID' in dt:
                         new = data.copy()
-                        new['DOMAIN_ID'] = data['DOMAIN_ID'] + _off
-                    if name not in nastran_dom:
-                        nastran_dom[name] = {'arrays': [new], 'attrs': atts, 'ckw': ckw}
-                    else:
-                        nastran_dom[name]['arrays'].append(new)
-                    ds_count[0] += 1
-                    return
+                        new['DOMAIN_ID'] = data['DOMAIN_ID'] + off
+                    nastran_dom.setdefault(path, {'arrays': [], 'attrs': attrs, 'ckw': ckw})
+                    nastran_dom[path]['arrays'].append(new)
 
                 # ── nastran_idx: konum/uzunluk indeksi ───────────────────
-                if kind == 'nastran_idx':
+                elif kind == 'nastran_idx':
                     new = data.copy()
-                    if _off != 0 and dt and 'DOMAIN_ID' in dt:
-                        new['DOMAIN_ID'] = data['DOMAIN_ID'] + _off
+                    if off != 0 and dt and 'DOMAIN_ID' in dt:
+                        new['DOMAIN_ID'] = data['DOMAIN_ID'] + off
                     # POSITION kaydırması Aşama 2'de yapılır
-                    if name not in nastran_idx:
-                        nastran_idx[name] = {
-                            'file_entries': [(new, _fi)],
-                            'attrs': atts, 'ckw': ckw,
-                        }
-                    else:
-                        nastran_idx[name]['file_entries'].append((new, _fi))
-                    ds_count[0] += 1
-                    return
+                    nastran_idx.setdefault(path, {'file_entries': [], 'attrs': attrs, 'ckw': ckw})
+                    nastran_idx[path]['file_entries'].append((new, fi))
 
                 # ── result_data: RESULT/ altı, DOMAIN_ID offset'li ────────
-                if kind == 'result_data':
-                    base = name.split('/')[-1]
+                elif kind == 'result_data':
+                    base       = path.split('/')[-1]
                     is_dom_tbl = (base == 'DOMAINS' and dt
                                   and 'ID' in dt and 'SUBCASE' in dt)
                     new = data
-                    if _off != 0:
+                    if off != 0:
                         new = data.copy()
                         if is_dom_tbl:
-                            new['ID'] = data['ID'] + _off
+                            new['ID'] = data['ID'] + off
                             if dt and 'DOMAIN_ID' in dt:
-                                new['DOMAIN_ID'] = data['DOMAIN_ID'] + _off
+                                new['DOMAIN_ID'] = data['DOMAIN_ID'] + off
                         elif dt and 'DOMAIN_ID' in dt:
-                            new['DOMAIN_ID'] = data['DOMAIN_ID'] + _off
-                    _frr[name] = len(data)
-                    if name not in result_data:
-                        result_data[name] = {'arrays': [new], 'attrs': atts, 'ckw': ckw}
-                    else:
-                        result_data[name]['arrays'].append(new)
-                    ds_count[0] += 1
+                            new['DOMAIN_ID'] = data['DOMAIN_ID'] + off
+                    file_rrows[path] = len(data)
+                    result_data.setdefault(path, {'arrays': [], 'attrs': attrs, 'ckw': ckw})
+                    result_data[path]['arrays'].append(new)
 
-            src_f.visititems(_read)
+                ds_count += 1
+
             result_rows[fi] = file_rrows
-            print(f"  → {ds_count[0]} dataset (offset +{off})")
+            print(f"  → {ds_count} dataset  "
+                  f"(geom:{len(geom)}  dom:{len(nastran_dom)}  "
+                  f"idx:{len(nastran_idx)}  result:{len(result_data)}  offset:+{off})")
 
     # ── Aşama 2: NASTRAN/RESULT/ POSITION değerlerini düzelt ────────────────
     #
