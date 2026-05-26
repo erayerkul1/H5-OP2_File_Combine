@@ -629,17 +629,25 @@ def combine_h5(input_files: list[str], output_path: str, conflict_mode: str | No
         sys.exit(1)
 
     # MSC Nastran H5 formatını otomatik tanı
-    print("  [v2.1-debug] Nastran H5 tespiti başlıyor...")
+    print("  [v2.2-debug] Nastran H5 tespiti başlıyor...")
     try:
         with h5py.File(input_files[0], 'r') as _f:
-            _rd = _f.get('RESULT/DOMAINS')
-            print(f"  [v2.1-debug] RESULT/DOMAINS: {_rd}")
-            if _rd is not None:
-                print(f"  [v2.1-debug] dtype.names: {_rd.dtype.names}")
+            print(f"  [v2.2-debug] Kök gruplar: {list(_f.keys())}")
+            if 'RESULT' in _f:
+                print(f"  [v2.2-debug] RESULT/ altı: {list(_f['RESULT'].keys())}")
+                if 'DOMAINS' in _f['RESULT']:
+                    _rd2 = _f['RESULT']['DOMAINS']
+                    print(f"  [v2.2-debug] RESULT/DOMAINS dtype.names: {_rd2.dtype.names}")
+                else:
+                    print("  [v2.2-debug] RESULT/DOMAINS YOK")
+            else:
+                print("  [v2.2-debug] 'RESULT' grubu hiç yok!")
             _nastran = _is_nastran_h5(_f)
-            print(f"  [v2.1-debug] _nastran={_nastran}")
+            print(f"  [v2.2-debug] _nastran={_nastran}")
     except Exception as _e:
-        print(f"  [v2.1-debug] Exception: {_e}")
+        import traceback
+        print(f"  [v2.2-debug] Exception: {_e}")
+        traceback.print_exc()
         _nastran = False
 
     if _nastran:
