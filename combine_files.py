@@ -189,50 +189,8 @@ def _set_nested_attr(obj, dotted_name: str, value) -> None:
 
 import re as _re
 
-# HyperView / Nastran H5'te subcase grupları bu kalıplarda isimlendirilir.
 # Separator (_  -  boşluk) zorunlu: SUBCASE_1 ✓  LC_3 ✓  CQUAD4 ✗  CHEXA8 ✗
 _SUBCASE_RE = _re.compile(r'^(.+[_\-\s])(\d+)$')
-
-# Geometri/girdi grubu olduğuna dair ipuçları (bu gruplar 2. dosyadan atlanır)
-_GEOMETRY_HINTS = {
-    'input', 'bulk', 'geometry', 'model', 'mesh',
-    'coordinate', 'coord', 'connectivity', 'node', 'nodes',
-    'element', 'elements', 'property', 'material', 'boundary',
-    'grid', 'cstm', 'case',
-}
-
-
-def _is_geometry_group(name: str, grp) -> bool:
-    """
-    Grubun geometri/girdi verisi içerdiğine dair buluşsal kural:
-    - Adı bilinen geometri anahtar sözcüklerinden biriyse → True
-    - Tüm çocukları dataset ise VE hiçbirinin adında sayısal suffix yoksa → True
-      (geometry arrays genelde GRID_ID, COORD gibi dataset'lerden oluşur)
-    """
-    import h5py
-    if name.lower() in _GEOMETRY_HINTS:
-        return True
-    # Alt öğelerin hepsi dataset ve hiçbirinde subcase deseni yoksa geometri say
-    children = list(grp.items())
-    if not children:
-        return False
-    all_datasets = all(isinstance(v, h5py.Dataset) for _, v in children)
-    none_numeric  = not any(_SUBCASE_RE.match(k) for k, _ in children)
-    return all_datasets and none_numeric
-
-
-def _has_subcase_descendants(grp, max_depth: int = 4) -> bool:
-    """Grup içinde herhangi bir derinlikte sayısal-suffix'li alt-grup var mı?"""
-    import h5py
-    if max_depth == 0:
-        return False
-    for child_name, child_obj in grp.items():
-        if _SUBCASE_RE.match(child_name):
-            return True
-        if isinstance(child_obj, h5py.Group):
-            if _has_subcase_descendants(child_obj, max_depth - 1):
-                return True
-    return False
 
 
 def _next_available_name(dst_parent_grp, conflicting_name: str) -> str | None:
@@ -252,28 +210,40 @@ def _next_available_name(dst_parent_grp, conflicting_name: str) -> str | None:
     return f"{prefix}{max_num + 1}"
 
 
+def _copy_attrs(src_grp, dst_grp) -> None:
+    """Kaynak grubun attribute'larını hedef gruba ekle (var olanların üzerine yazma)."""
+    for k, v in src_grp.attrs.items():
+        if k not in dst_grp.attrs:
+            try:
+                dst_grp.attrs[k] = v
+            except Exception:
+                pass
+
+
 def _h5_deep_merge(src_file, dst_file, src_grp_path: str, dst_grp_path: str,
                    file_idx: int, counters: list) -> None:
     """
     Özyinelemeli H5 birleştirme — HyperView / Nastran uyumlu.
 
-    Kural tablosu (file_idx > 0, yani 2. dosyadan itibaren):
-    ┌───────────────────────┬────────────────────────────────────────────────────┐
-    │ Durum                 │ Davranış                                           │
-    ├───────────────────────┼────────────────────────────────────────────────────┤
-    │ Grup: sayısal suffix  │ Subcase → KOMPLE kopyala, yeni isim ver           │
-    │ (SUBCASE_N, LC_N …)   │ (içine girme, iç yapı korunur)                    │
-    ├───────────────────────┼────────────────────────────────────────────────────┤
-    │ Grup: sayısal yok +   │ Sonuç ara grubu (RESULTS, NODAL …)                │
-    │ subcase çocuğu var    │ → içine gir, özyinelemeli birleştir                │
-    ├───────────────────────┼────────────────────────────────────────────────────┤
-    │ Grup: sayısal yok +   │ Geometri/input (mesh, coord, element …)            │
-    │ subcase çocuğu yok    │ → ATLA (duplicate element id hatasını önler)       │
-    ├───────────────────────┼────────────────────────────────────────────────────┤
-    │ Dataset: hedefte yok  │ Kopyala                                            │
-    │ Dataset: hedefte var  │ ATLA (geometri verisi, her dosyada aynı)           │
-    └───────────────────────┴────────────────────────────────────────────────────┘
-    file_idx == 0 (ilk dosya): her şey olduğu gibi kopyalanır.
+    İki basit kural:
+
+    GRUPLAR
+    ───────
+    • Hedefte yok          → her zaman kopyala
+    • Hedefte var + sayısal suffix (SUBCASE_N, LC_N …)
+                           → grubu KOMPLE yeni sıralı isimle kopyala
+    • Hedefte var + sayısal suffix yok (RESULTS, NODAL, INPUT …)
+                           → her zaman özyinelemeli birleştir
+                             (_has_subcase_descendants kontrolü YOK —
+                              depth sınırı sorununu giderir)
+
+    DATASET'LER
+    ───────────
+    • Hedefte yok          → kopyala
+    • Hedefte var          → ATLA
+                             (geometri datası — düğüm/eleman koordinatları —
+                              her dosyada aynı; kopyalamak "Duplicate element id"
+                              hatasına yol açar)
     """
     import h5py
 
@@ -289,14 +259,12 @@ def _h5_deep_merge(src_file, dst_file, src_grp_path: str, dst_grp_path: str,
             has_numeric_suffix = bool(_SUBCASE_RE.match(name))
 
             if dst_child not in dst_file:
-                # Hedefte yok
-                if file_idx == 0 or has_numeric_suffix or _has_subcase_descendants(item):
-                    src_file.copy(src_child, dst_file, name=dst_child)
-                    counters[0] += _count_datasets(item)
-                # else: 2. dosyadan gelen yeni geometri grubu → atla
+                # ── Hedefte yok → her zaman kopyala ────────────────────────
+                src_file.copy(src_child, dst_file, name=dst_child)
+                counters[0] += _count_datasets(item)
 
             elif has_numeric_suffix:
-                # ── Subcase grubu çakışıyor → yeni sıralı isim ver ──────────
+                # ── Subcase çakışıyor → yeni sıralı isim ver ───────────────
                 new_name = _next_available_name(dst_parent_grp, name)
                 if new_name is None:
                     new_name = name + f"_f{file_idx + 1}"
@@ -310,26 +278,18 @@ def _h5_deep_merge(src_file, dst_file, src_grp_path: str, dst_grp_path: str,
                 print(f"      ↳ {name} → {new_name}")
                 counters[0] += _count_datasets(item)
 
-            elif _has_subcase_descendants(item):
-                # ── Sonuç ara grubu (RESULTS, NODAL …) → içine gir ─────────
-                for k, v in item.attrs.items():
-                    if k not in dst_file[dst_child].attrs:
-                        try:
-                            dst_file[dst_child].attrs[k] = v
-                        except Exception:
-                            pass
+            else:
+                # ── Ara grup (RESULTS, NODAL, INPUT …) → her zaman özyinele ─
+                _copy_attrs(item, dst_file[dst_child])
                 _h5_deep_merge(src_file, dst_file, src_child, dst_child,
                                file_idx, counters)
 
-            else:
-                # ── Geometri/input grubu → atla (duplicate element id önlenir)
-                pass
-
         elif isinstance(item, h5py.Dataset):
             if dst_child not in dst_file:
+                # ── Yeni dataset → kopyala ──────────────────────────────────
                 src_file.copy(src_child, dst_file, name=dst_child)
                 counters[0] += 1
-            # else: var olan dataset = geometri/aynı veri → atla
+            # else: var olan dataset (geometri) → atla
 
 
 def _count_datasets(grp) -> int:
