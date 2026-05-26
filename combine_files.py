@@ -91,16 +91,15 @@ def combine_op2(input_files: list[str], output_path: str) -> None:
 
     print(f"\n{len(input_files)} adet OP2 dosyası okunuyor...")
 
-    combined = OP2(debug=False)
-    combined.read_mode = 1
-
+    combined: OP2 | None = None
     subcase_offset = 0
-    all_table_types = combined.get_table_types()
 
     for file_idx, filepath in enumerate(input_files):
         print(f"  [{file_idx+1}/{len(input_files)}] Okunuyor: {os.path.basename(filepath)}")
         op2 = OP2(debug=False)
         op2.read_op2(filepath)
+
+        all_table_types = op2.get_table_types()
 
         # Bu dosyadaki maksimum subcase ID'yi bul
         file_max_subcase = 0
@@ -112,7 +111,14 @@ def combine_op2(input_files: list[str], output_path: str) -> None:
                     if isinstance(sc_id, int):
                         file_max_subcase = max(file_max_subcase, sc_id)
 
-        # Sonuçları combined nesnesine kopyala (subcase offset uygula)
+        if combined is None:
+            # İlk dosyayı temel al — başlık/metadata bu objede korunur
+            combined = op2
+            print(f"    → temel dosya olarak alındı (max subcase: {file_max_subcase})")
+            subcase_offset = file_max_subcase if file_max_subcase > 0 else 1
+            continue
+
+        # Sonraki dosyaların sonuçlarını combined'a ekle (offset + isubcase güncelle)
         merged_count = 0
         for table_name in all_table_types:
             result_dict = _get_nested_attr(op2, table_name)
@@ -126,9 +132,18 @@ def combine_op2(input_files: list[str], output_path: str) -> None:
 
             for key, result_obj in result_dict.items():
                 if isinstance(key, tuple):
-                    new_key = (key[0] + subcase_offset,) + key[1:]
+                    new_sc = key[0] + subcase_offset
+                    new_key = (new_sc,) + key[1:]
                 else:
-                    new_key = key + subcase_offset
+                    new_sc = key + subcase_offset
+                    new_key = new_sc
+
+                # pyNastran yazarken result_obj.isubcase değerini kullanır;
+                # dictionary key'i ile senkron olmazsa subcase çakışması yaşanır.
+                try:
+                    result_obj.isubcase = new_sc
+                except AttributeError:
+                    pass  # salt okunur ya da yoksa geç
 
                 combined_dict[new_key] = result_obj
                 merged_count += 1
@@ -136,10 +151,14 @@ def combine_op2(input_files: list[str], output_path: str) -> None:
         print(f"    → {merged_count} sonuç tablosu eklendi (subcase offset: {subcase_offset})")
         subcase_offset += file_max_subcase if file_max_subcase > 0 else 1
 
+    if combined is None:
+        print("HATA: Hiç dosya okunamadı.")
+        return
+
     print(f"\nBirleştirilmiş dosya yazılıyor: {output_path}")
     combined.write_op2(output_path, post=-1)
     size_mb = os.path.getsize(output_path) / (1024 * 1024)
-    print(f"Tamamlandı. Dosya boyutu: {size_mb:.2f} MB")
+    print(f"✓ Tamamlandı! Dosya boyutu: {size_mb:.2f} MB")
 
 
 def _get_nested_attr(obj, dotted_name: str):
