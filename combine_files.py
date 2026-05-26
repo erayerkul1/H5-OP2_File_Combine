@@ -187,6 +187,31 @@ def _set_nested_attr(obj, dotted_name: str, value) -> None:
 # H5 Birleştirme
 # ──────────────────────────────────────────────
 
+import re as _re
+
+# HyperView / Nastran H5'te subcase grupları bu kalıplarda isimlendirilir
+_SUBCASE_RE = _re.compile(
+    r'^(.*?[_\-\s]?)(\d+)$'   # SUBCASE_1 → prefix="SUBCASE_", num=1
+)
+
+
+def _next_available_name(dst_parent_grp, conflicting_name: str) -> str:
+    """
+    'SUBCASE_1' çakıştıysa → mevcut SUBCASE_N isimlerinin maksimumunu bul,
+    SUBCASE_(max+1) döndür.  Sayısal kalıp yoksa None döndür.
+    """
+    m = _SUBCASE_RE.match(conflicting_name)
+    if not m:
+        return None
+    prefix = m.group(1)          # örn. "SUBCASE_"
+    max_num = 0
+    for child_name in dst_parent_grp:
+        cm = _re.match(r'^' + _re.escape(prefix) + r'(\d+)$', child_name)
+        if cm:
+            max_num = max(max_num, int(cm.group(1)))
+    return f"{prefix}{max_num + 1}"
+
+
 def _h5_deep_merge(src_file, dst_file, src_grp_path: str, dst_grp_path: str,
                    file_idx: int, counters: list) -> None:
     """
@@ -195,15 +220,17 @@ def _h5_deep_merge(src_file, dst_file, src_grp_path: str, dst_grp_path: str,
 
     Strateji:
     - Grup yoksa  → tümüyle kopyala (içindeki her şeyle)
-    - Grup varsa  → attribute ekle, içine in ve aynı işlemi tekrarla
-                    ANCAK iç item'lar dataset ise (yaprak grup = sonuç grubu)
-                    grubu bütünüyle _fN adıyla kopyala (HyperView uyumluluğu)
+    - Grup varsa  → attribute ekle, içine in (özyinelemeli)
+                    ANCAK yaprak grup ise (tüm çocuklar dataset):
+                      • sayısal kalıp varsa  → SUBCASE_1 → SUBCASE_2 (HyperView uyumlu)
+                      • yoksa               → _fN soneki ekle
     - Dataset yoksa → kopyala
-    - Dataset varsa → _fN sonekiyle yeniden adlandır
+    - Dataset varsa → sayısal kalıp denenir, yoksa _fN soneki
     """
     import h5py
 
     src_grp = src_file[src_grp_path] if src_grp_path != "/" else src_file
+    dst_parent_grp = dst_file[dst_grp_path] if dst_grp_path and dst_grp_path != "/" else dst_file
 
     for name, item in src_grp.items():
         src_child = f"{src_grp_path.rstrip('/')}/{name}".lstrip("/")
@@ -211,27 +238,30 @@ def _h5_deep_merge(src_file, dst_file, src_grp_path: str, dst_grp_path: str,
 
         if isinstance(item, h5py.Group):
             if dst_child not in dst_file:
-                # Hedefte hiç yok → tümünü tek seferde kopyala
+                # Hedefte yok → tümünü kopyala
                 src_file.copy(src_child, dst_file, name=dst_child)
                 counters[0] += _count_datasets(item)
             else:
-                # Hedefte var → bu grubun "yaprak grup" (leaf group) olup
-                # olmadığını kontrol et: içindeki tüm çocuklar dataset ise
-                # grubu bütünüyle _fN adıyla kopyala; değilse içine gir.
-                all_children_are_datasets = all(
-                    isinstance(item[child], h5py.Dataset) for child in item
-                )
-                if all_children_are_datasets:
-                    # Yaprak grup (örn. SUBCASE_1) → grubu bütünüyle rename et
-                    suffix = 2
-                    candidate = f"{dst_child}_f{file_idx + 1}"
-                    while candidate in dst_file:
-                        candidate = f"{dst_child}_f{file_idx + 1}_{suffix}"
-                        suffix += 1
-                    src_file.copy(src_child, dst_file, name=candidate)
+                # Hedefte var: yaprak grup mu, ara grup mu?
+                all_leaf = all(isinstance(item[c], h5py.Dataset) for c in item)
+                if all_leaf:
+                    # Yaprak grup (örn. SUBCASE_1) → HyperView uyumlu rename
+                    new_name = _next_available_name(dst_parent_grp, name)
+                    if new_name is None:
+                        # Sayısal kalıp yok → _fN yedek
+                        new_name = f"{name}_f{file_idx + 1}"
+                        n = 2
+                        base_dst = f"{dst_grp_path.rstrip('/')}/{new_name}".lstrip("/")
+                        while base_dst in dst_file:
+                            new_name = f"{name}_f{file_idx + 1}_{n}"
+                            base_dst = f"{dst_grp_path.rstrip('/')}/{new_name}".lstrip("/")
+                            n += 1
+                    new_dst = f"{dst_grp_path.rstrip('/')}/{new_name}".lstrip("/")
+                    src_file.copy(src_child, dst_file, name=new_dst)
+                    print(f"      ↳ {name} → {new_name}")
                     counters[0] += _count_datasets(item)
                 else:
-                    # Ara grup → attribute'ları ekle ve içine in
+                    # Ara grup → attribute ekle, içine gir
                     for k, v in item.attrs.items():
                         if k not in dst_file[dst_child].attrs:
                             try:
@@ -246,13 +276,17 @@ def _h5_deep_merge(src_file, dst_file, src_grp_path: str, dst_grp_path: str,
                 src_file.copy(src_child, dst_file, name=dst_child)
                 counters[0] += 1
             else:
-                # Çakışan dataset → _fN sonekiyle yeniden adlandır
-                suffix = 2
-                candidate = f"{dst_child}_f{file_idx + 1}"
-                while candidate in dst_file:
-                    candidate = f"{dst_child}_f{file_idx + 1}_{suffix}"
-                    suffix += 1
-                src_file.copy(src_child, dst_file, name=candidate)
+                # Çakışan dataset → sayısal rename dene, yoksa _fN
+                new_name = _next_available_name(dst_parent_grp, name)
+                if new_name is None:
+                    new_name = f"{name}_f{file_idx + 1}"
+                new_dst = f"{dst_grp_path.rstrip('/')}/{new_name}".lstrip("/")
+                n = 2
+                while new_dst in dst_file:
+                    new_name = f"{name}_f{file_idx + 1}_{n}"
+                    new_dst = f"{dst_grp_path.rstrip('/')}/{new_name}".lstrip("/")
+                    n += 1
+                src_file.copy(src_child, dst_file, name=new_dst)
                 counters[0] += 1
 
 
