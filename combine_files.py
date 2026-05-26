@@ -218,68 +218,68 @@ def _h5_deep_merge(src_file, dst_file, src_grp_path: str, dst_grp_path: str,
     src_file içindeki src_grp_path grubunu dst_file'ın dst_grp_path grubuna
     özyinelemeli olarak birleştirir.
 
-    Strateji:
-    - Grup yoksa  → tümüyle kopyala (içindeki her şeyle)
-    - Grup varsa  → attribute ekle, içine in (özyinelemeli)
-                    ANCAK yaprak grup ise (tüm çocuklar dataset):
-                      • sayısal kalıp varsa  → SUBCASE_1 → SUBCASE_2 (HyperView uyumlu)
-                      • yoksa               → _fN soneki ekle
-    - Dataset yoksa → kopyala
-    - Dataset varsa → sayısal kalıp denenir, yoksa _fN soneki
+    Kural (basitleştirilmiş, HyperView uyumlu):
+    ┌─────────────────────────────────────────────────────────────┐
+    │ Grup adı sayısal suffix içeriyorsa (SUBCASE_1, LC_3 …)     │
+    │   → çakışırsa grubu KOMPLE yeni isimle kopyala             │
+    │     (içine girme — iç yapı bozulmasın)                      │
+    │ Sayısal suffix yoksa (RESULTS, NODAL …)                     │
+    │   → çakışırsa içine gir, özyinelemeli birleştir             │
+    │ Dataset çakışırsa → _fN soneki (nadiren olur)               │
+    └─────────────────────────────────────────────────────────────┘
     """
     import h5py
 
     src_grp = src_file[src_grp_path] if src_grp_path != "/" else src_file
-    dst_parent_grp = dst_file[dst_grp_path] if dst_grp_path and dst_grp_path != "/" else dst_file
+    dst_parent_grp = (dst_file[dst_grp_path]
+                      if dst_grp_path and dst_grp_path != "/" else dst_file)
 
     for name, item in src_grp.items():
         src_child = f"{src_grp_path.rstrip('/')}/{name}".lstrip("/")
         dst_child = f"{dst_grp_path.rstrip('/')}/{name}".lstrip("/")
 
         if isinstance(item, h5py.Group):
+            has_numeric_suffix = bool(_SUBCASE_RE.match(name))
+
             if dst_child not in dst_file:
-                # Hedefte yok → tümünü kopyala
+                # Hedefte yok → tümünü olduğu gibi kopyala
                 src_file.copy(src_child, dst_file, name=dst_child)
                 counters[0] += _count_datasets(item)
-            else:
-                # Hedefte var: yaprak grup mu, ara grup mu?
-                all_leaf = all(isinstance(item[c], h5py.Dataset) for c in item)
-                if all_leaf:
-                    # Yaprak grup (örn. SUBCASE_1) → HyperView uyumlu rename
-                    new_name = _next_available_name(dst_parent_grp, name)
-                    if new_name is None:
-                        # Sayısal kalıp yok → _fN yedek
-                        new_name = f"{name}_f{file_idx + 1}"
-                        n = 2
-                        base_dst = f"{dst_grp_path.rstrip('/')}/{new_name}".lstrip("/")
-                        while base_dst in dst_file:
-                            new_name = f"{name}_f{file_idx + 1}_{n}"
-                            base_dst = f"{dst_grp_path.rstrip('/')}/{new_name}".lstrip("/")
-                            n += 1
+
+            elif has_numeric_suffix:
+                # SUBCASE_N, LC_N gibi: grubu KOMPLE yeni isimle kopyala
+                # (içine girme — iç yapı dataset/alt-grup ne olursa olsun korunur)
+                new_name = _next_available_name(dst_parent_grp, name)
+                if new_name is None:                      # yedek: _fN
+                    new_name = name + f"_f{file_idx + 1}"
+                new_dst = f"{dst_grp_path.rstrip('/')}/{new_name}".lstrip("/")
+                n = 2
+                while new_dst in dst_file:               # isim yine çakışırsa
+                    new_name = name + f"_f{file_idx + 1}_{n}"
                     new_dst = f"{dst_grp_path.rstrip('/')}/{new_name}".lstrip("/")
-                    src_file.copy(src_child, dst_file, name=new_dst)
-                    print(f"      ↳ {name} → {new_name}")
-                    counters[0] += _count_datasets(item)
-                else:
-                    # Ara grup → attribute ekle, içine gir
-                    for k, v in item.attrs.items():
-                        if k not in dst_file[dst_child].attrs:
-                            try:
-                                dst_file[dst_child].attrs[k] = v
-                            except Exception:
-                                pass
-                    _h5_deep_merge(src_file, dst_file, src_child, dst_child,
-                                   file_idx, counters)
+                    n += 1
+                src_file.copy(src_child, dst_file, name=new_dst)
+                print(f"      ↳ {name} → {new_name}")
+                counters[0] += _count_datasets(item)
+
+            else:
+                # RESULTS, NODAL, ELEMENTAL … gibi ara gruplar → içine gir
+                for k, v in item.attrs.items():
+                    if k not in dst_file[dst_child].attrs:
+                        try:
+                            dst_file[dst_child].attrs[k] = v
+                        except Exception:
+                            pass
+                _h5_deep_merge(src_file, dst_file, src_child, dst_child,
+                               file_idx, counters)
 
         elif isinstance(item, h5py.Dataset):
             if dst_child not in dst_file:
                 src_file.copy(src_child, dst_file, name=dst_child)
                 counters[0] += 1
             else:
-                # Çakışan dataset → sayısal rename dene, yoksa _fN
-                new_name = _next_available_name(dst_parent_grp, name)
-                if new_name is None:
-                    new_name = f"{name}_f{file_idx + 1}"
+                # Çakışan dataset (genellikle olmaz, yedek davranış)
+                new_name = f"{name}_f{file_idx + 1}"
                 new_dst = f"{dst_grp_path.rstrip('/')}/{new_name}".lstrip("/")
                 n = 2
                 while new_dst in dst_file:
