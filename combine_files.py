@@ -297,33 +297,38 @@ def _count_datasets(grp) -> int:
 def _is_nastran_h5(h5file) -> bool:
     """
     MSC Nastran native H5 formatını tanır.
-    RESULT/DOMAINS'e doğrudan erişir — güvenilir, O(1), exception riski yok.
+    İki olası konum denenir:
+      • NASTRAN/RESULT/DOMAINS  (yeni format: kök altında NASTRAN/ var)
+      • RESULT/DOMAINS          (eski format: kök altında RESULT/ var)
     """
-    try:
-        ds = h5file.get('RESULT/DOMAINS')
-        if ds is not None:
-            dt = getattr(ds, 'dtype', None)
-            if dt is not None and dt.names:
-                return 'ID' in dt.names and 'SUBCASE' in dt.names
-    except Exception:
-        pass
+    for candidate in ('NASTRAN/RESULT/DOMAINS', 'RESULT/DOMAINS'):
+        try:
+            ds = h5file.get(candidate)
+            if ds is not None:
+                dt = getattr(ds, 'dtype', None)
+                if dt is not None and dt.names:
+                    if 'ID' in dt.names and 'SUBCASE' in dt.names:
+                        return True
+        except Exception:
+            pass
     return False
 
 
 def _find_all_domains_paths(h5file) -> list[str]:
     """
-    RESULT/DOMAINS yolunu doğrudan döndürür.
-    NASTRAN/INPUT/DOMAINS (superelement yapısı) dahil edilmez.
+    DOMAINS dataset yollarını doğrudan döndürür.
+    NASTRAN/RESULT/DOMAINS (yeni) veya RESULT/DOMAINS (eski) kontrol edilir.
     """
     paths = []
-    try:
-        ds = h5file.get('RESULT/DOMAINS')
-        if ds is not None:
-            dt = getattr(ds, 'dtype', None)
-            if dt is not None and dt.names and 'ID' in dt.names and 'SUBCASE' in dt.names:
-                paths.append('RESULT/DOMAINS')
-    except Exception:
-        pass
+    for candidate in ('NASTRAN/RESULT/DOMAINS', 'RESULT/DOMAINS'):
+        try:
+            ds = h5file.get(candidate)
+            if ds is not None:
+                dt = getattr(ds, 'dtype', None)
+                if dt is not None and dt.names and 'ID' in dt.names and 'SUBCASE' in dt.names:
+                    paths.append(candidate)
+        except Exception:
+            pass
     return paths
 
 
@@ -388,19 +393,28 @@ def combine_h5_nastran(input_files: list[str], output_path: str) -> None:
 
     # ── Yardımcı: dataset kategorisi ────────────────────────────────────────
     def _classify(name: str, obj) -> str:
-        if name == 'INDEX' or name.startswith('INDEX/'):
-            return 'skip'
         dt = obj.dtype.names
         has_domain_id = dt is not None and 'DOMAIN_ID' in dt
 
-        if name.startswith('NASTRAN/RESULT/'):
-            if dt is not None and 'POSITION' in dt and 'LENGTH' in dt:
+        # INDEX/ altındaki NASTRAN/RESULT/ yansımaları → konum/uzunluk indeksi
+        # Örnek: INDEX/NASTRAN/RESULT/ELEMENTAL/ELEMENT_FORCE/BAR
+        if name.startswith('INDEX/'):
+            if (name.startswith('INDEX/NASTRAN/RESULT/')
+                    and dt is not None
+                    and 'POSITION' in dt and 'LENGTH' in dt):
                 return 'nastran_idx'
+            return 'skip'   # diğer INDEX/ içerikleri (INPUT indeksleri vb.)
+
+        # NASTRAN/RESULT/ → gerçek sonuç verileri + DOMAINS tablosu
+        # (yeni format: RESULT kök altında değil, NASTRAN altında)
+        if name.startswith('NASTRAN/RESULT/'):
+            return 'result_data'
+
+        # NASTRAN/INPUT/ ve diğer NASTRAN/ alt yolları
+        if name.startswith('NASTRAN/'):
             return 'nastran_dom' if has_domain_id else 'geometry'
 
-        if name.startswith('NASTRAN/'):   # INPUT/ ve diğer NASTRAN/ altı
-            return 'nastran_dom' if has_domain_id else 'geometry'
-
+        # Eski format: RESULT/ kök altında
         if name.startswith('RESULT/'):
             return 'result_data'
 
@@ -461,9 +475,6 @@ def combine_h5_nastran(input_files: list[str], output_path: str) -> None:
             ds_count = 0
 
             for path, ds in _walk_h5(src_f):
-                if path == 'INDEX' or path.startswith('INDEX/'):
-                    continue
-
                 kind  = _classify(path, ds)
                 if kind == 'skip':
                     continue
@@ -536,8 +547,12 @@ def combine_h5_nastran(input_files: list[str], output_path: str) -> None:
     #   → RESULT/ELEMENTAL/ELEMENT_FORCE/BAR   (prefix: NASTRAN/ → "")
 
     for npath, info in nastran_idx.items():
-        # NASTRAN/RESULT/X → RESULT/X
-        rpath = npath[len('NASTRAN/'):]   # 'NASTRAN/RESULT/...' → 'RESULT/...'
+        # INDEX/NASTRAN/RESULT/X → NASTRAN/RESULT/X  (yeni format)
+        # NASTRAN/RESULT/X      → RESULT/X           (eski format, fallback)
+        if npath.startswith('INDEX/NASTRAN/'):
+            rpath = npath[len('INDEX/'):]          # 'INDEX/NASTRAN/RESULT/...' → 'NASTRAN/RESULT/...'
+        else:
+            rpath = npath[len('NASTRAN/'):]        # 'NASTRAN/RESULT/...' → 'RESULT/...'
 
         cumulative = 0
         adjusted = []
@@ -629,25 +644,10 @@ def combine_h5(input_files: list[str], output_path: str, conflict_mode: str | No
         sys.exit(1)
 
     # MSC Nastran H5 formatını otomatik tanı
-    print("  [v2.2-debug] Nastran H5 tespiti başlıyor...")
     try:
         with h5py.File(input_files[0], 'r') as _f:
-            print(f"  [v2.2-debug] Kök gruplar: {list(_f.keys())}")
-            if 'RESULT' in _f:
-                print(f"  [v2.2-debug] RESULT/ altı: {list(_f['RESULT'].keys())}")
-                if 'DOMAINS' in _f['RESULT']:
-                    _rd2 = _f['RESULT']['DOMAINS']
-                    print(f"  [v2.2-debug] RESULT/DOMAINS dtype.names: {_rd2.dtype.names}")
-                else:
-                    print("  [v2.2-debug] RESULT/DOMAINS YOK")
-            else:
-                print("  [v2.2-debug] 'RESULT' grubu hiç yok!")
             _nastran = _is_nastran_h5(_f)
-            print(f"  [v2.2-debug] _nastran={_nastran}")
-    except Exception as _e:
-        import traceback
-        print(f"  [v2.2-debug] Exception: {_e}")
-        traceback.print_exc()
+    except Exception:
         _nastran = False
 
     if _nastran:
