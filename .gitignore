@@ -1,17 +1,19 @@
-# Test / geçici çıktı dosyaları
-test*.h5
-test*.op2
-combined*.h5
-combined*.op2
-sample*.op2
+# Test / geçici dosyalar
+*.h5
+*.op2
+!requirements.txt
 
 # Python
 __pycache__/
 *.pyc
 *.pyo
-.venv/
+*.pyd
+.Python
 *.egg-info/
+dist/
+build/
 
 # IDE
 .vscode/
 .idea/
+*.swp
