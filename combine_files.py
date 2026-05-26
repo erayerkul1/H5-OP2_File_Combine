@@ -297,7 +297,8 @@ def _count_datasets(grp) -> int:
 def _is_nastran_h5(h5file) -> bool:
     """
     MSC Nastran native H5 formatını tanır.
-    Kriter: 'ID' alanı olan bir DOMAINS dataset'i varsa Nastran H5'tir.
+    Kriter: 'RESULT/DOMAINS' yolunda SUBCASE alanı olan bir dataset varsa.
+    (NASTRAN/INPUT/DOMAINS farklı bir yapıdır — karışmaması için SUBCASE şartı.)
     """
     import h5py
     found = [False]
@@ -306,9 +307,11 @@ def _is_nastran_h5(h5file) -> bool:
         if found[0]:
             return
         if (isinstance(obj, h5py.Dataset)
+                and name.startswith('RESULT/')
                 and name.split('/')[-1] == 'DOMAINS'
                 and obj.dtype.names is not None
-                and 'ID' in obj.dtype.names):
+                and 'ID' in obj.dtype.names
+                and 'SUBCASE' in obj.dtype.names):
             found[0] = True
 
     h5file.visititems(_visit)
@@ -316,15 +319,20 @@ def _is_nastran_h5(h5file) -> bool:
 
 
 def _find_all_domains_paths(h5file) -> list[str]:
-    """Dosyadaki tüm DOMAINS dataset yollarını bulur."""
+    """
+    Yalnızca RESULT/DOMAINS tipindeki yolları bulur.
+    NASTRAN/INPUT/DOMAINS (superelement yapısı) dahil edilmez.
+    """
     import h5py
     paths = []
 
     def _visit(name, obj):
         if (isinstance(obj, h5py.Dataset)
+                and name.startswith('RESULT/')
                 and name.split('/')[-1] == 'DOMAINS'
                 and obj.dtype.names is not None
-                and 'ID' in obj.dtype.names):
+                and 'ID' in obj.dtype.names
+                and 'SUBCASE' in obj.dtype.names):
             paths.append(name)
 
     h5file.visititems(_visit)
@@ -342,7 +350,6 @@ def _get_create_kwargs(dataset) -> dict:
         if dataset.compression_opts is not None:
             kwargs['compression_opts'] = dataset.compression_opts
     if dataset.chunks is not None:
-        # Orijinal chunk boyutunu koru — h5py yeni boyutu otomatik ayarlar
         kwargs['chunks'] = True
     return kwargs
 
@@ -351,22 +358,28 @@ def combine_h5_nastran(input_files: list[str], output_path: str) -> None:
     """
     MSC Nastran native H5 dosyalarını DOMAIN_ID offset yöntemiyle birleştirir.
 
-    Neden iki aşama?
-    ────────────────
-    "copy-then-modify" (shutil.copy2 + del+create) iki sorun yaratır:
-      1. Sıkıştırma kaybı  — del sonrası create_dataset sıkıştırmayı unutur;
-         gzip ile 4:1 sıkışmış 72 MB dosya 280+ MB'a çıkabilir.
-      2. HDF5 parçalanması — del işlemi alanı sisteme iade etmez; eski veri
-         "hayalet" olarak dosyada kalır, boyut şişer.
+    Dosya yapısı (inspect_h5.py çıktısından):
+    ──────────────────────────────────────────
+    NASTRAN/INPUT/ELEMENT/CQUAD4  shape=(167822,)  ← geometri, DOMAIN_ID YOK
+    NASTRAN/INPUT/NODE/GRID       shape=(173987,)  ← DOMAIN_ID VAR (domain-specific)
+    NASTRAN/INPUT/LOAD/FORCE      shape=(1,)       ← DOMAIN_ID VAR (domain-specific)
+    NASTRAN/INPUT/CONSTRAINT/SPC  shape=(310,)     ← DOMAIN_ID VAR (domain-specific)
+    NASTRAN/RESULT/ELEMENTAL/…    shape=(1,)       ← konum/uzunluk İNDEKSİ
+                                    dtype=[DOMAIN_ID, POSITION, LENGTH]
+    RESULT/DOMAINS                shape=(1,)       ← subcase tablosu
+    RESULT/ELEMENTAL/…            shape=(N,)       ← gerçek sonuç verisi
 
-    Çözüm — Topla → Sıfırdan Yaz
-    ─────────────────────────────
-    Aşama 1: Tüm dosyaları RAM'e oku.
-      • Geometri dataset'leri: yalnızca ilk dosyadan.
-      • Sonuç dataset'leri (DOMAIN_ID veya DOMAINS): tüm dosyalardan,
-        offset uygulanarak.
-    Aşama 2: Çıktıyı sıfırdan oluştur; her dataset tek seferinde, orijinal
-      sıkıştırma/chunk ayarlarıyla yaz → parçalanma yok, boyut minimal.
+    Dört dataset kategorisi:
+    ────────────────────────
+    1. geometry    — NASTRAN/INPUT/ altında DOMAIN_ID YOK → yalnızca dosya-1'den kopyala
+    2. nastran_dom — NASTRAN/INPUT/ altında DOMAIN_ID VAR → tüm dosyalardan birleştir
+    3. nastran_idx — NASTRAN/RESULT/ altında POSITION+LENGTH alanları var
+                     HyperView'ın RESULT/ dizilerine erişim indeksi.
+                     Birleştirme sırasında POSITION değerleri önceki dosyaların
+                     toplam satır sayısı kadar kaydırılır.
+    4. result_data — RESULT/ altında her şey → tüm dosyalardan birleştir
+
+    Algoritma — Topla → Sıfırdan Yaz (parçalanma yok, sıkıştırma korunur)
     """
     import h5py
     import numpy as np
@@ -374,48 +387,68 @@ def combine_h5_nastran(input_files: list[str], output_path: str) -> None:
     print(f"\n{len(input_files)} adet MSC Nastran H5 dosyası birleştiriliyor "
           f"(domain-ID modu)...")
 
-    # ── Aşama 1: Topla ──────────────────────────────────────────────────────
-    # collected[path] = {'arrays': [...], 'attrs': {}, 'ckw': {}}
-    # group_attrs[path] = {attr_name: value}
-    collected: dict = {}
-    group_attrs: dict = {}
-    current_max_id = 0   # çıktıda şimdiye kadar yazılan en büyük DOMAIN ID
+    # ── Yardımcı: dataset kategorisi ────────────────────────────────────────
+    def _classify(name: str, obj) -> str:
+        if name == 'INDEX' or name.startswith('INDEX/'):
+            return 'skip'
+        dt = obj.dtype.names
+        has_domain_id = dt is not None and 'DOMAIN_ID' in dt
 
-    for file_idx, filepath in enumerate(input_files):
-        label = os.path.basename(filepath)
-        print(f"  [{file_idx+1}/{len(input_files)}] Okunuyor: {label}", end="", flush=True)
+        if name.startswith('NASTRAN/RESULT/'):
+            if dt is not None and 'POSITION' in dt and 'LENGTH' in dt:
+                return 'nastran_idx'
+            return 'nastran_dom' if has_domain_id else 'geometry'
+
+        if name.startswith('NASTRAN/'):   # INPUT/ ve diğer NASTRAN/ altı
+            return 'nastran_dom' if has_domain_id else 'geometry'
+
+        if name.startswith('RESULT/'):
+            return 'result_data'
+
+        return 'geometry'
+
+    # ── Veri kapları ─────────────────────────────────────────────────────────
+    geom: dict        = {}   # path → {array, attrs, ckw}
+    nastran_dom: dict = {}   # path → {arrays:[], attrs, ckw}
+    nastran_idx: dict = {}   # path → {file_entries:[(arr,fi),...], attrs, ckw}
+    result_data: dict = {}   # path → {arrays:[], attrs, ckw}
+    group_attrs: dict = {}
+
+    # RESULT/ dataset başına her dosyadan alınan satır sayısı
+    # result_rows[fi][path] = satır_sayısı
+    result_rows: dict = {}
+
+    current_max_id = 0
+
+    # ── Aşama 1: Topla ───────────────────────────────────────────────────────
+    for fi, filepath in enumerate(input_files):
+        print(f"  [{fi+1}/{len(input_files)}] Okunuyor: {os.path.basename(filepath)}",
+              end="", flush=True)
 
         with h5py.File(filepath, 'r') as src_f:
-            # Kök attribute'ları ilk dosyadan sakla
-            if file_idx == 0:
-                collected['__root_attrs__'] = dict(src_f.attrs)
+            if fi == 0:
+                geom['__root_attrs__'] = dict(src_f.attrs)
 
-            # Bu dosyanın minimum DOMAIN ID'sini bul (offset hesabı için)
+            # Domain offset hesapla
             src_dp = _find_all_domains_paths(src_f)
-            min_src_id = 1
+            min_src = 1
             for dp in src_dp:
                 d = src_f[dp][()]
-                if len(d) > 0:
-                    min_src_id = min(min_src_id, int(d['ID'].min()))
+                if len(d):
+                    min_src = min(min_src, int(d['ID'].min()))
 
-            domain_offset = (current_max_id - min_src_id + 1) if current_max_id > 0 else 0
+            off = (current_max_id - min_src + 1) if current_max_id > 0 else 0
 
-            # Bu dosyanın maksimum DOMAIN ID'sini (offset sonrası) güncelle
             for dp in src_dp:
                 d = src_f[dp][()]
-                if len(d) > 0:
-                    current_max_id = max(
-                        current_max_id,
-                        int(d['ID'].max()) + domain_offset,
-                    )
+                if len(d):
+                    current_max_id = max(current_max_id,
+                                         int(d['ID'].max()) + off)
 
-            ds_read = [0]
+            file_rrows: dict = {}   # bu dosyadaki RESULT/ satır sayıları
+            ds_count = [0]
 
-            def _read_item(name, obj, _fi=file_idx, _off=domain_offset):
-                # INDEX grubunu atla — birleştirme sonrası geçersiz
-                if name == 'INDEX' or name.startswith('INDEX/'):
-                    return
-
+            def _read(name, obj, _fi=fi, _off=off, _frr=file_rrows):
                 if isinstance(obj, h5py.Group):
                     if _fi == 0:
                         ga = dict(obj.attrs)
@@ -423,104 +456,171 @@ def combine_h5_nastran(input_files: list[str], output_path: str) -> None:
                             group_attrs[name] = ga
                     return
 
-                # ── Dosya 2+ için yol filtresi ─────────────────────────────
-                # Yalnızca kök RESULT/ altındaki dataset'ler birleştirilir.
-                #
-                # NASTRAN/ bölümü (INPUT + RESULT/şablonlar) model tanımıdır;
-                # DOMAIN_ID alanı olsa bile birden fazla yazılırsa HyperView
-                # "Duplicate element id" hatası verir.  Bu nedenle NASTRAN/
-                # her zaman yalnızca ilk dosyadan alınır.
-                if _fi > 0 and not name.startswith('RESULT/'):
+                kind = _classify(name, obj)
+                if kind == 'skip':
                     return
 
-                # Dataset sınıflandır
-                base_name = name.split('/')[-1]
-                dt_names = obj.dtype.names
+                dt   = obj.dtype.names
+                data = obj[()]
+                ckw  = _get_create_kwargs(obj)
+                atts = dict(obj.attrs)
 
-                is_domains_ds = (
-                    base_name == 'DOMAINS'
-                    and dt_names is not None
-                    and 'ID' in dt_names
-                )
-                has_domain_id = dt_names is not None and 'DOMAIN_ID' in dt_names
-                is_result = is_domains_ds or has_domain_id
-
-                # RESULT/ altında bile DOMAIN_ID olmayan dataset'ler (nadiren
-                # görülen config satırları) dosya 1'den alınır; sonrakilerden atlanır.
-                if _fi > 0 and not is_result:
+                # ── geometry: yalnızca dosya 1 ────────────────────────────
+                if kind == 'geometry':
+                    if _fi == 0:
+                        geom[name] = {'array': data, 'attrs': atts, 'ckw': ckw}
+                    ds_count[0] += 1
                     return
 
-                src_data = obj[()]
-
-                # DOMAIN ID'leri offset'le
-                if is_result and _off != 0:
-                    new_data = src_data.copy()
-                    if is_domains_ds:
-                        new_data['ID'] = src_data['ID'] + _off
-                        if 'DOMAIN_ID' in dt_names:
-                            new_data['DOMAIN_ID'] = src_data['DOMAIN_ID'] + _off
+                # ── nastran_dom: tüm dosyalardan, DOMAIN_ID offset'li ─────
+                if kind == 'nastran_dom':
+                    new = data
+                    if _off != 0 and dt and 'DOMAIN_ID' in dt:
+                        new = data.copy()
+                        new['DOMAIN_ID'] = data['DOMAIN_ID'] + _off
+                    if name not in nastran_dom:
+                        nastran_dom[name] = {'arrays': [new], 'attrs': atts, 'ckw': ckw}
                     else:
-                        new_data['DOMAIN_ID'] = src_data['DOMAIN_ID'] + _off
-                else:
-                    new_data = src_data
+                        nastran_dom[name]['arrays'].append(new)
+                    ds_count[0] += 1
+                    return
 
-                if name not in collected:
-                    collected[name] = {
-                        'arrays': [new_data],
-                        'attrs': dict(obj.attrs),
-                        'ckw': _get_create_kwargs(obj),
-                    }
-                else:
-                    collected[name]['arrays'].append(new_data)
+                # ── nastran_idx: konum/uzunluk indeksi ───────────────────
+                if kind == 'nastran_idx':
+                    new = data.copy()
+                    if _off != 0 and dt and 'DOMAIN_ID' in dt:
+                        new['DOMAIN_ID'] = data['DOMAIN_ID'] + _off
+                    # POSITION kaydırması Aşama 2'de yapılır
+                    if name not in nastran_idx:
+                        nastran_idx[name] = {
+                            'file_entries': [(new, _fi)],
+                            'attrs': atts, 'ckw': ckw,
+                        }
+                    else:
+                        nastran_idx[name]['file_entries'].append((new, _fi))
+                    ds_count[0] += 1
+                    return
 
-                ds_read[0] += 1
+                # ── result_data: RESULT/ altı, DOMAIN_ID offset'li ────────
+                if kind == 'result_data':
+                    base = name.split('/')[-1]
+                    is_dom_tbl = (base == 'DOMAINS' and dt
+                                  and 'ID' in dt and 'SUBCASE' in dt)
+                    new = data
+                    if _off != 0:
+                        new = data.copy()
+                        if is_dom_tbl:
+                            new['ID'] = data['ID'] + _off
+                            if dt and 'DOMAIN_ID' in dt:
+                                new['DOMAIN_ID'] = data['DOMAIN_ID'] + _off
+                        elif dt and 'DOMAIN_ID' in dt:
+                            new['DOMAIN_ID'] = data['DOMAIN_ID'] + _off
+                    _frr[name] = len(data)
+                    if name not in result_data:
+                        result_data[name] = {'arrays': [new], 'attrs': atts, 'ckw': ckw}
+                    else:
+                        result_data[name]['arrays'].append(new)
+                    ds_count[0] += 1
 
-            src_f.visititems(_read_item)
-            print(f"  → {ds_read[0]} dataset okundu (offset: +{domain_offset})")
+            src_f.visititems(_read)
+            result_rows[fi] = file_rrows
+            print(f"  → {ds_count[0]} dataset (offset +{off})")
 
-    # ── Aşama 2: Sıfırdan Yaz ───────────────────────────────────────────────
-    print(f"\n  Çıktı yazılıyor: {os.path.basename(output_path)}")
+    # ── Aşama 2: NASTRAN/RESULT/ POSITION değerlerini düzelt ────────────────
+    #
+    # NASTRAN/RESULT/X (dtype: DOMAIN_ID, POSITION, LENGTH) bir indekstir:
+    #   POSITION = karşılık gelen RESULT/X dizisinde bu domain'in verisi
+    #              kaçıncı satırdan başlar?
+    #   LENGTH   = bu domain için kaç satır var?
+    #
+    # Dosyaları birleştirince RESULT/X dizisinin başına dosya-1'in tüm
+    # satırları gelir.  Dosya-2'nin NASTRAN/RESULT/X girdilerindeki POSITION
+    # değerleri, dosya-1'in toplam satır sayısı kadar kaydırılmalıdır.
+    #
+    # NASTRAN/RESULT/ELEMENTAL/ELEMENT_FORCE/BAR
+    #   → RESULT/ELEMENTAL/ELEMENT_FORCE/BAR   (prefix: NASTRAN/ → "")
+
+    for npath, info in nastran_idx.items():
+        # NASTRAN/RESULT/X → RESULT/X
+        rpath = npath[len('NASTRAN/'):]   # 'NASTRAN/RESULT/...' → 'RESULT/...'
+
+        cumulative = 0
+        adjusted = []
+        for (arr, fi) in info['file_entries']:
+            a = arr.copy()
+            if arr.dtype.names and 'POSITION' in arr.dtype.names:
+                a['POSITION'] = arr['POSITION'] + cumulative
+            adjusted.append(a)
+            cumulative += result_rows.get(fi, {}).get(rpath, 0)
+
+        info['adjusted'] = adjusted
+
+    # ── Aşama 3: Sıfırdan Yaz ────────────────────────────────────────────────
+    print(f"\n  Yazılıyor: {os.path.basename(output_path)}")
+
+    def _write_ds(out_f, path, data, attrs, ckw):
+        parent = '/'.join(path.split('/')[:-1])
+        if parent and parent not in out_f:
+            out_f.require_group(parent)
+        try:
+            ds = out_f.create_dataset(path, data=data, **ckw)
+        except Exception:
+            ds = out_f.create_dataset(path, data=data)
+        for k, v in attrs.items():
+            try:
+                ds.attrs[k] = v
+            except Exception:
+                pass
 
     with h5py.File(output_path, 'w') as out_f:
         # Kök attribute'lar
-        for k, v in collected.pop('__root_attrs__', {}).items():
+        for k, v in geom.pop('__root_attrs__', {}).items():
             try:
                 out_f.attrs[k] = v
             except Exception:
                 pass
 
         # Grup attribute'ları
-        for grp_path, attrs in group_attrs.items():
-            g = out_f.require_group(grp_path)
-            for k, v in attrs.items():
+        for gp, ga in group_attrs.items():
+            g = out_f.require_group(gp)
+            for k, v in ga.items():
                 try:
                     g.attrs[k] = v
                 except Exception:
                     pass
 
-        # Dataset'leri yaz (tek seferinde, orijinal sıkıştırmayla)
-        written = 0
-        for path, info in collected.items():
-            arrays = info['arrays']
-            data = np.concatenate(arrays) if len(arrays) > 1 else arrays[0]
+        # 1. Geometri (dosya 1'den)
+        cnt = [0]
+        for path, info in geom.items():
+            _write_ds(out_f, path, info['array'], info['attrs'], info['ckw'])
+            cnt[0] += 1
 
-            parent = '/'.join(path.split('/')[:-1])
-            if parent and parent not in out_f:
-                out_f.require_group(parent)
+        # 2. Domain-specific NASTRAN/INPUT/ (tümünden birleştirildi)
+        for path, info in nastran_dom.items():
+            data = (np.concatenate(info['arrays'])
+                    if len(info['arrays']) > 1 else info['arrays'][0])
+            _write_ds(out_f, path, data, info['attrs'], info['ckw'])
+            cnt[0] += 1
 
-            try:
-                ds = out_f.create_dataset(path, data=data, **info['ckw'])
-            except Exception:
-                ds = out_f.create_dataset(path, data=data)
+        # 3. NASTRAN/RESULT/ indeks (konumlar düzeltildi)
+        for path, info in nastran_idx.items():
+            arrs = info['adjusted']
+            data = np.concatenate(arrs) if len(arrs) > 1 else arrs[0]
+            _write_ds(out_f, path, data, info['attrs'], info['ckw'])
+            cnt[0] += 1
 
-            for k, v in info['attrs'].items():
-                try:
-                    ds.attrs[k] = v
-                except Exception:
-                    pass
-            written += 1
+        # 4. RESULT/ verileri
+        for path, info in result_data.items():
+            data = (np.concatenate(info['arrays'])
+                    if len(info['arrays']) > 1 else info['arrays'][0])
+            _write_ds(out_f, path, data, info['attrs'], info['ckw'])
+            cnt[0] += 1
 
-        print(f"    → {written} dataset yazıldı")
+        print(f"    → {cnt[0]} dataset yazıldı  "
+              f"(geometri: {len(geom)}  "
+              f"nastran-dom: {len(nastran_dom)}  "
+              f"nastran-idx: {len(nastran_idx)}  "
+              f"result: {len(result_data)})")
 
     size_mb = os.path.getsize(output_path) / (1024 * 1024)
     print(f"\n✓ Tamamlandı: {output_path} ({size_mb:.2f} MB)")
