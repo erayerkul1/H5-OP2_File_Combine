@@ -104,7 +104,10 @@ def combine_op2(input_files: list[str], output_path: str) -> None:
         # Bu dosyadaki maksimum subcase ID'yi bul
         file_max_subcase = 0
         for table_name in all_table_types:
-            result_dict = _get_nested_attr(op2, table_name)
+            try:
+                result_dict = op2.get_result(table_name)
+            except Exception:
+                continue
             if result_dict and isinstance(result_dict, dict):
                 for key in result_dict:
                     sc_id = key[0] if isinstance(key, tuple) else key
@@ -119,16 +122,24 @@ def combine_op2(input_files: list[str], output_path: str) -> None:
             continue
 
         # Sonraki dosyaların sonuçlarını combined'a ekle (offset + isubcase güncelle)
+        # get_result() kullanılır: dotted path ('stress.cbar_stress') için
+        # op2.op2_results.stress.cbar_stress'e, flat path için op2.displacements'e
+        # doğru yönlendirir. _get_nested_attr op2.stress diye arar ve None döner.
         merged_count = 0
         for table_name in all_table_types:
-            result_dict = _get_nested_attr(op2, table_name)
+            try:
+                result_dict = op2.get_result(table_name)
+            except Exception:
+                continue
             if not result_dict or not isinstance(result_dict, dict):
                 continue
 
-            combined_dict = _get_nested_attr(combined, table_name)
-            if combined_dict is None:
-                combined_dict = {}
-                _set_nested_attr(combined, table_name, combined_dict)
+            try:
+                combined_dict = combined.get_result(table_name)
+            except Exception:
+                continue
+            if not isinstance(combined_dict, dict):
+                continue
 
             for key, result_obj in result_dict.items():
                 if isinstance(key, tuple):
@@ -138,12 +149,10 @@ def combine_op2(input_files: list[str], output_path: str) -> None:
                     new_sc = key + subcase_offset
                     new_key = new_sc
 
-                # pyNastran yazarken result_obj.isubcase değerini kullanır;
-                # dictionary key'i ile senkron olmazsa subcase çakışması yaşanır.
                 try:
                     result_obj.isubcase = new_sc
                 except AttributeError:
-                    pass  # salt okunur ya da yoksa geç
+                    pass
 
                 combined_dict[new_key] = result_obj
                 merged_count += 1
