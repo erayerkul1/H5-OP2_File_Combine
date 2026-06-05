@@ -79,93 +79,196 @@ def get_output_path(extension: str) -> str:
 
 
 # ──────────────────────────────────────────────
-# OP2 Birleştirme
+# OP2 Birleştirme — binary seviyesinde
 # ──────────────────────────────────────────────
 
+# MSC Nastran OP2 dosyalarında tablo başlangıcı imzası:
+#   [4, 2, 4]  (12 byte)  +  [8, <8-char tablo adı>, 8]  (20 byte)
+_OP2_TBL_PREFIX = b'\x04\x00\x00\x00\x02\x00\x00\x00\x04\x00\x00\x00\x08\x00\x00\x00'
+_OP2_EOF_MARKER = b'\x04\x00\x00\x00\x00\x00\x00\x00\x04\x00\x00\x00'   # [4, 0, 4]
+_OP2_IDENT_LEN_BYTES = b'\x48\x02\x00\x00'   # 584 little-endian (146 words × 4)
+_OP2_TABLE3_FOOTER = b'\x04\x00\x00\x00\x92\x00\x00\x00\x04\x00\x00\x00'  # [4, 146, 4]
+
+# Gerçek tablo olmayan başlık dizgeleri (dosya başlığı içinde yer alır)
+_OP2_NON_TABLE_NAMES: set[bytes] = {b'XXXXXXXX', b'NX8.5   ', b'NX      '}
+
+# Geometri tabloları — 2. ve sonraki dosyalarda atlanır
+_OP2_GEOM_TABLES: set[bytes] = {
+    b'GEOM1   ', b'GEOM1S  ', b'GEOM2   ', b'GEOM2S  ',
+    b'GEOM3   ', b'GEOM4   ', b'GEOM4S  ', b'EPT     ',
+    b'EPTS    ', b'MPT     ', b'MPTS    ', b'EDT     ',
+    b'EDOM    ', b'DIT     ', b'DYNAMIC ', b'CASECC  ',
+    b'VIEWTB  ', b'ERRORN  ', b'DESTAB  ', b'CONTACT ',
+    b'GEOM1N  ', b'GEOM2N  ', b'GEOM4N  ',
+}
+
+
+def _op2_find_tables(data: bytes) -> list[tuple[bytes, int]]:
+    """OP2 binary verisindeki tüm gerçek tablo başlangıçlarını bul.
+    Returns list of (table_name_8bytes, start_offset)."""
+    tables: list[tuple[bytes, int]] = []
+    pos = 0
+    while True:
+        idx = data.find(_OP2_TBL_PREFIX, pos)
+        if idx < 0:
+            break
+        if idx + 28 > len(data):
+            break
+        name = data[idx + 16: idx + 24]
+        footer_ok = data[idx + 24: idx + 28] == b'\x08\x00\x00\x00'
+        if footer_ok and name not in _OP2_NON_TABLE_NAMES:
+            tables.append((name, idx))
+        pos = idx + 1
+    return tables
+
+
+def _op2_patch_isubcase(data: bytes, orig_subcases: set[int], offset: int) -> bytes:
+    """OP2 binary bloğundaki IDENT kayıtlarında isubcase değerini artır.
+
+    IDENT kaydı (146 word = 584 byte) yapısı:
+      [4, 146, 4]  (öncesinde)
+      [584] [approach_code | table_code | element_type | isubcase | ...] [584]
+    isubcase = word[3] = byte offset 12, dosya offset = record_start + 4 + 12
+    """
+    import struct as _struct
+    result = bytearray(data)
+    pos = 0
+    patches = 0
+
+    while pos < len(result):
+        # IDENT kaydını [4,146,4]+[584,...,584] kalıbıyla bul
+        idx = bytes(result).find(_OP2_IDENT_LEN_BYTES, pos)
+        if idx < 0:
+            break
+        # 12 byte öncesi [4, 146, 4] olmalı
+        if idx < 12 or bytes(result[idx - 12: idx]) != _OP2_TABLE3_FOOTER:
+            pos = idx + 1
+            continue
+        # Footer: 584 byte sonra yine [584] olmalı
+        footer_pos = idx + 4 + 584
+        if footer_pos + 4 > len(result):
+            break
+        if result[footer_pos: footer_pos + 4] != b'\x48\x02\x00\x00':
+            pos = idx + 1
+            continue
+        # approach_code (word 0) geçerli aralıkta mı?
+        acode = _struct.unpack('<i', result[idx + 4: idx + 8])[0]
+        if not (1 <= acode <= 20):
+            pos = idx + 1
+            continue
+        # isubcase (word 3 = byte offset 12)
+        isc_pos = idx + 4 + 12
+        isc = _struct.unpack('<i', result[isc_pos: isc_pos + 4])[0]
+        if isc in orig_subcases:
+            _struct.pack_into('<i', result, isc_pos, isc + offset)
+            patches += 1
+        pos = footer_pos + 4
+
+    if patches:
+        print(f"      {patches} IDENT kaydında isubcase güncellendi (+{offset})")
+    return bytes(result)
+
+
+def _op2_get_subcases(op2) -> tuple[set[int], int]:
+    """pyNastran OP2 nesnesinden subcase ID kümesini ve maksimumunu döndür."""
+    subcases: set[int] = set()
+    for t in op2.get_table_types():
+        try:
+            d = op2.get_result(t)
+        except Exception:
+            continue
+        if not isinstance(d, dict):
+            continue
+        for key in d:
+            sc = key[0] if isinstance(key, tuple) else key
+            if isinstance(sc, int):
+                subcases.add(sc)
+    max_sc = max(subcases) if subcases else 1
+    return subcases, max_sc
+
+
 def combine_op2(input_files: list[str], output_path: str) -> None:
+    """Binary seviyesinde OP2 birleştirme.
+
+    pyNastran'ın write_op2() MSC formatındaki force/stress tablolarını
+    doğru yazamadığı için (round-trip testi de başarısız) binary kopyalama
+    ve IDENT kayıtlarında isubcase yaması yapılır.
+    """
     try:
         from pyNastran.op2.op2 import OP2
     except ImportError:
         print("HATA: pyNastran kurulu değil. Kurmak için: pip install pyNastran")
         sys.exit(1)
 
-    print(f"\n{len(input_files)} adet OP2 dosyası okunuyor...")
+    print(f"\n{len(input_files)} adet OP2 dosyası binary seviyesinde birleştiriliyor...")
 
-    combined: OP2 | None = None
-    subcase_offset = 0
-
+    # 1) Her dosyanın subcase bilgilerini ve max subcase'ini öğren
+    files_info: list[dict] = []
     for file_idx, filepath in enumerate(input_files):
-        print(f"  [{file_idx+1}/{len(input_files)}] Okunuyor: {os.path.basename(filepath)}")
+        print(f"  [{file_idx + 1}/{len(input_files)}] Okunuyor: {os.path.basename(filepath)}")
         op2 = OP2(debug=False)
         op2.read_op2(filepath)
+        subcases, max_sc = _op2_get_subcases(op2)
+        print(f"    → {len(subcases)} subcase: {sorted(subcases)} (max: {max_sc})")
+        files_info.append({'filepath': filepath, 'subcases': subcases, 'max_sc': max_sc})
 
-        all_table_types = op2.get_table_types()
+    # 2) Her dosya için subcase offset hesapla
+    offsets = [0]
+    for i in range(len(files_info) - 1):
+        offsets.append(offsets[-1] + files_info[i]['max_sc'])
 
-        # Bu dosyadaki maksimum subcase ID'yi bul
-        file_max_subcase = 0
-        for table_name in all_table_types:
-            try:
-                result_dict = op2.get_result(table_name)
-            except Exception:
+    # 3) Binary tabloları çıkar ve birleştir
+    output_chunks: list[bytes] = []
+
+    for file_idx, info in enumerate(files_info):
+        filepath = info['filepath']
+        subcases = info['subcases']
+        sc_offset = offsets[file_idx]
+
+        with open(filepath, 'rb') as f:
+            data = f.read()
+
+        table_positions = _op2_find_tables(data)
+        if not table_positions:
+            print(f"  HATA: {os.path.basename(filepath)} içinde tablo bulunamadı!")
+            return
+
+        # İlk dosya için dosya başlığını (tablolardan önceki kısım) al
+        if file_idx == 0:
+            first_tbl_start = table_positions[0][1]
+            output_chunks.append(data[:first_tbl_start])
+
+        # Her tablo bloğunu çıkar
+        n_tables = len(table_positions)
+        for i, (tbl_name, tbl_start) in enumerate(table_positions):
+            tbl_end = table_positions[i + 1][1] if i + 1 < n_tables else len(data)
+            tbl_bytes = data[tbl_start:tbl_end]
+
+            # Son tablo: dosya EOF [4,0,4]'ü çıkar
+            if i == n_tables - 1 and tbl_bytes.endswith(_OP2_EOF_MARKER):
+                tbl_bytes = tbl_bytes[:-12]
+
+            # Geometri tabloları 2. ve sonraki dosyalarda atla
+            if file_idx > 0 and tbl_name in _OP2_GEOM_TABLES:
                 continue
-            if result_dict and isinstance(result_dict, dict):
-                for key in result_dict:
-                    sc_id = key[0] if isinstance(key, tuple) else key
-                    if isinstance(sc_id, int):
-                        file_max_subcase = max(file_max_subcase, sc_id)
 
-        if combined is None:
-            # İlk dosyayı temel al — başlık/metadata bu objede korunur
-            combined = op2
-            print(f"    → temel dosya olarak alındı (max subcase: {file_max_subcase})")
-            subcase_offset = file_max_subcase if file_max_subcase > 0 else 1
-            continue
+            # isubcase yaması
+            if sc_offset > 0:
+                tbl_bytes = _op2_patch_isubcase(tbl_bytes, subcases, sc_offset)
 
-        # Sonraki dosyaların sonuçlarını combined'a ekle (offset + isubcase güncelle)
-        # get_result() kullanılır: dotted path ('stress.cbar_stress') için
-        # op2.op2_results.stress.cbar_stress'e, flat path için op2.displacements'e
-        # doğru yönlendirir. _get_nested_attr op2.stress diye arar ve None döner.
-        merged_count = 0
-        for table_name in all_table_types:
-            try:
-                result_dict = op2.get_result(table_name)
-            except Exception:
-                continue
-            if not result_dict or not isinstance(result_dict, dict):
-                continue
+            tname_str = tbl_name.rstrip(b' ').decode('ascii', errors='replace')
+            print(f"    [{file_idx + 1}] tablo: {tname_str:12s}  ({len(tbl_bytes):,} byte)")
+            output_chunks.append(tbl_bytes)
 
-            try:
-                combined_dict = combined.get_result(table_name)
-            except Exception:
-                continue
-            if not isinstance(combined_dict, dict):
-                continue
+    # 4) Dosya sonu işaretçisi
+    output_chunks.append(_OP2_EOF_MARKER)
 
-            for key, result_obj in result_dict.items():
-                if isinstance(key, tuple):
-                    new_sc = key[0] + subcase_offset
-                    new_key = (new_sc,) + key[1:]
-                else:
-                    new_sc = key + subcase_offset
-                    new_key = new_sc
-
-                try:
-                    result_obj.isubcase = new_sc
-                except AttributeError:
-                    pass
-
-                combined_dict[new_key] = result_obj
-                merged_count += 1
-
-        print(f"    → {merged_count} sonuç tablosu eklendi (subcase offset: {subcase_offset})")
-        subcase_offset += file_max_subcase if file_max_subcase > 0 else 1
-
-    if combined is None:
-        print("HATA: Hiç dosya okunamadı.")
-        return
-
+    # 5) Çıktı dosyasına yaz
     print(f"\nBirleştirilmiş dosya yazılıyor: {output_path}")
-    combined.write_op2(output_path, post=-1)
+    with open(output_path, 'wb') as f:
+        for chunk in output_chunks:
+            f.write(chunk)
+
     size_mb = os.path.getsize(output_path) / (1024 * 1024)
     print(f"✓ Tamamlandı! Dosya boyutu: {size_mb:.2f} MB")
 
